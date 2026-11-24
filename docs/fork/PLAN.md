@@ -138,6 +138,18 @@ client ──TCP──▶ macrdp-broker (root LaunchDaemon; accept() only, never
    work in the LoginWindow context (whatever Phase 0 proves).
 4. "Session moving": a graceful disconnect that clients treat as a reconnect.
 
+**Finding (2026-11-24): IronRDP already has the seams for hooks 2 and 4.** Upstream
+`ironrdp-server` (and the clintcan fork macrdp pins) has `RdpServer::serve(&mut impl
+ConnectionSource)`, documented for "an embedder that accepts connections itself … sockets
+handed over by the service manager"; `run` is just `serve` over a bound TCP socket. So
+`--listen-from-broker` is a macrdp-only `ConnectionSource` that receives fds over a Unix
+socket (SCM_RIGHTS), with no IronRDP divergence. It also has `ServerRedirectionHandle::redirect
+(ServerRedirectionPdu)` ("the client reconnects to the target the PDU describes, as it would for
+an RD Connection Broker"), plus `ErrorInfoDisconnectHandle`. Session moving can therefore try a
+Server Redirection PDU pointing back at the broker's address before falling back to a plain
+disconnect + auto-reconnect. Spike C should measure both with each client. macrdp uses none of
+these today.
+
 The broker, its launchd plists and the installer changes are a separate package: either
 `packaging/system-mode/` upstream, or a companion repo `jm2/macrdp-system` if upstream
 prefers to keep root code out of tree.
@@ -298,4 +310,4 @@ with real clients.
 
 | Date | Session | Phase | Summary | Next |
 |---|---|---|---|---|
-| 2026-11-24 | 1 | 0 | Fork setup done (`upstream` remote added; `main` == upstream f46bfd9; branch `feat/loginwindow-phase0`). Built the B1/B2 probe (`spikes/loginwindow-probe/`): a Swift LaunchAgent that records uid, security session, CGSession, TCC preflights and code signature, tries six capture paths (SCK content/screenshot/stream, CGDisplayStream, CGDisplayCreateImage, CGWindowListCreateImage, `screencapture`), runs a net-zero type/erase per event tap at the login window, and exposes a token-gated loopback command socket (`ctl.sh`). Smoke-tested from the user session while the Mac was locked with its display asleep: SCK lists no displays, and the CoreGraphics paths return black frames (as upstream's #231 note says), so the capture code is only validated end to end once it runs against an awake screen. | User: `build.sh`, `sudo install.sh`, grant Screen Recording + Accessibility, Fast-User-Switch to the login window for ≥60 s, log back in. Then analyse `latest-loginwindow/`, drive Return with a throwaway test account, and write up B1/B2. |
+| 2026-11-24 | 1 | 0 | Fork setup done (`upstream` remote added; `main` == upstream f46bfd9; branch `feat/loginwindow-phase0`). Built the B1/B2 probe (`spikes/loginwindow-probe/`): a Swift LaunchAgent that records uid, security session, CGSession, TCC preflights and code signature, tries six capture paths (SCK content/screenshot/stream, CGDisplayStream, CGDisplayCreateImage, CGWindowListCreateImage, `screencapture`), runs a net-zero type/erase per event tap at the login window, and exposes a token-gated loopback command socket (`ctl.sh`). Smoke-tested from the user session while the Mac was locked with its display asleep: SCK lists no displays, and the CoreGraphics paths return black frames (as upstream's #231 note says), so the capture code is only validated end to end once it runs against an awake screen. Found that upstream IronRDP already provides `ConnectionSource`/`serve` and `ServerRedirectionHandle` (see §4), which shrinks Option L's hooks 2 and 4. | User: `build.sh`, `sudo install.sh`, grant Screen Recording + Accessibility, Fast-User-Switch to the login window for ≥60 s, log back in. Then analyse `latest-loginwindow/`, drive Return with a throwaway test account, and write up B1/B2. |
