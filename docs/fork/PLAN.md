@@ -71,6 +71,15 @@ Two consequences:
 - **Goal 2 needs a process in the LoginWindow context.** Upstream's "blocked" finding doesn't
   cover that case, and that's what Phase 0 tests.
 
+**Upstream since then (checked 2026-11-25, upstream 132ebdf / v0.11.2):** multi-monitor
+sessions (`--multi-monitor`, experimental: one virtual display and one H.264 stream per client
+monitor; refused with the headless modes, `VD_HIDPI` and `--no-client-resolution`), network
+auto-detect on by default, `--restore-windows-on-disconnect` in plain `--virtual-display` mode,
+a USB redirection fix, and an IronRDP fork pin of `f2c42733` (multi-monitor and USB commits
+only; nothing in credentials, NLA or takeover). The table above still holds. Upstream's agreed
+next steps (TODO, 2026-11-26) include making the virtual display main only while a client is
+connected (a per-session `--make-primary`); see §10a for why that matters here.
+
 ## 3. Target UX: the "front door" model
 
 1. **Network gate:** the client authenticates with NLA using an **RDP access credential**: a
@@ -229,7 +238,8 @@ with real clients.
 ### Phase 1 — Access-credential mode (≈1–2 weeks; independent of Phase 0's outcome)
 - [x] `--auth access-credential` (config `AUTH_MODE=access-credential`): skip the PAM check;
       IronRDP `Credentials` come from the access credential. Default stays `account`.
-      *(Branch `feat/access-credential` 033b5ad, off upstream f46bfd9. Plus a
+      *(Branch `feat/access-credential` e461812, rebased 2026-11-25 onto upstream 132ebdf
+      (v0.11.2); first cut 033b5ad off f46bfd9. Plus a
       `CredentialValidator` against the current secret: see §11, session 2.)*
 - [x] `macrdp credential rotate|show-username|status`; random secret shown once; Keychain item
       separate from anything the account-password flow uses. *(Service `macrdp-access`;
@@ -277,12 +287,18 @@ with real clients.
       location.
 
 ### Phase 4 — Multi-monitor (lower priority)
-- [ ] PR to **Devolutions/IronRDP**: multi-monitor `MonitorLayoutPdu` support in
-      `ironrdp-acceptor` (upstream macrdp's documented blocker). Then ask clintcan to pick it up
-      in the next fork rebase, rather than adding another fork divergence.
-- [ ] In macrdp: N virtual displays, following upstream's TODO design question (true monitors
-      vs one big desktop). Agree the design with the maintainer first. Transom is the
-      multi-monitor reference client.
+*Rewritten 2026-11-25: upstream built this itself.* v0.11.0 shipped multi-monitor sessions
+(`--multi-monitor`): one virtual display per client monitor, one EGFX surface and encoder per
+monitor, live layout changes on mstsc and Windows App for Windows. The acceptor change is
+clintcan/IronRDP divergence (8) plus server (36), marked as a candidate for Devolutions; that
+PR is the maintainer's to send, not ours. Design: upstream `docs/multi-monitor-design.md`.
+What's left is testing and filling upstream's own gaps, coordinated with the maintainer:
+- [ ] Live-test `--multi-monitor` with Transom (the reference client here) and Windows App for
+      macOS, which upstream hasn't covered; report results upstream.
+- [ ] Headless modes with multi-monitor, `--shield-primary` first (the lockable one): upstream
+      lists it as unsupported for now and not planned soon. Only if the maintainer wants it.
+- [ ] The login-window instance (Phase 2) serves one monitor; check that a multi-monitor client
+      falls back cleanly when its connection lands there.
 
 ## 7. Upstreaming rules (from upstream `docs/conventions.md`)
 - One concern per module, gated behind a flag; byte-identical when off.
@@ -332,7 +348,9 @@ with real clients.
   loop until the display wakes. The LoginWindow instance (Phase 2) will start at boot with the
   display possibly asleep, so it needs the size query to tolerate this (fall back to
   `--width/--height`, or wake the display first as `display_awake.rs` does for clients). Found
-  2026-11-24 while live-testing Phase 1; worth an upstream issue.
+  2026-11-24 while live-testing Phase 1; worth an upstream issue. **Still present in v0.11.2**
+  (2026-11-25): #232 wakes the displays when a client authenticates and at capture start, both
+  after startup's size query.
 - **IronRDP authenticates takeover candidates against the credentials captured when the live
   session began** (`RdpServerHandle::set_credentials` docs; its own comment says "UNTESTED").
   After a credential change the old password can still evict the session unless a
@@ -343,6 +361,20 @@ with real clients.
 - **The validator needs delegated credentials.** With a validator set, IronRDP refuses a client
   that completes NLA without delegating credentials (Restricted Admin / Remote Credential
   Guard). FreeRDP 3.33 delegates; mstsc, Windows App and Transom are still to be checked.
+- **What the remote client sees of the lock screen depends on the display arrangement.**
+  `loginwindow` draws the lock screen on the main display. Upstream's notes on `--shield-primary`
+  (default keep-physical-main) record two different outcomes: locked *during* a session, the
+  client kept showing the virtual display's desktop while its keystrokes went to the (unseen)
+  password field; locked by `--lock-on-disconnect` and then *reconnected*, the client saw the
+  login screen and unlocked by typing. Phase 1's DoD ("a remote user unlocks via the real lock
+  screen") needs both cases checked live, per primary mode. Upstream plans to make the virtual
+  display main while a client is connected (TODO, 2026-11-26), which would change the first
+  case; re-check when it lands.
+- **Rebasing onto upstream can merge new password uses silently.** v0.11.x added a fourth
+  `spawn_primary_overlay_watcher` call taking `Arc::clone(&password)`; git merged it cleanly,
+  but in access-credential mode that value is the access secret. Fixed in e461812 (it takes
+  `unlock_password`, empty in this mode). After each rebase, grep upstream's diff for new
+  `password`/`Credentials` uses.
 - **FreeRDP `/auth-only`** is a good scripted NLA probe, but `sdl-freerdp` exits 1 even on
   success: read its `Authentication only, ERRBASE_SUCCESS` log line instead.
 
@@ -352,3 +384,4 @@ with real clients.
 |---|---|---|---|---|
 | 2026-11-24 | 1 | 0 | Fork setup done (`upstream` remote added; `main` == upstream f46bfd9; branch `feat/loginwindow-phase0`). Built the B1/B2 probe (`spikes/loginwindow-probe/`): a Swift LaunchAgent that records uid, security session, CGSession, TCC preflights and code signature, tries six capture paths (SCK content/screenshot/stream, CGDisplayStream, CGDisplayCreateImage, CGWindowListCreateImage, `screencapture`), runs a net-zero type/erase per event tap at the login window, and exposes a token-gated loopback command socket (`ctl.sh`). Smoke-tested from the user session while the Mac was locked with its display asleep: SCK lists no displays, and the CoreGraphics paths return black frames (as upstream's #231 note says), so the capture code is only validated end to end once it runs against an awake screen. Found that upstream IronRDP already provides `ConnectionSource`/`serve` and `ServerRedirectionHandle` (see §4), which shrinks Option L's hooks 2 and 4. | User: `build.sh`, `sudo install.sh`, grant Screen Recording + Accessibility, Fast-User-Switch to the login window for ≥60 s, log back in. Then analyse `latest-loginwindow/`, drive Return with a throwaway test account, and write up B1/B2. |
 | 2026-11-24 | 2 | 1 | Target set to macOS 27.2.1 (26/15 inferred). Phase 1 implemented on `feat/access-credential` (033b5ad, off upstream f46bfd9, pushed to the fork): `--auth access-credential` / `AUTH_MODE`, `macrdp credential rotate\|status\|show-username`, Keychain item `macrdp-access` written through `security -i` on stdin, stamp-file rotation with no restart and no Keychain polling, a validator against the current secret (closes the takeover gap in §10a), `--auto-unlock`/`--password`/`--password-file`/`--skip-auth` refused, the new `no-access-credential` status, controller sign-in picker + show-once dialog, and docs. 459 tests pass, including NLA rotation/takeover tests (mutation-checked); fmt + clippy clean on 1.95.0. Live on this Mac with FreeRDP 3.33 over NLA: the current secret is accepted; wrong, rotated-out and removed ones are refused; rotation applies within 3 s via `config.env`. | User: accept the Xcode license (`sudo xcodebuild -license`) so the controller can be built and clicked through; live-verify with mstsc, Windows App and Transom (sign in, lock, unlock at the lock screen, rotate); decide on a fork-internal draft PR to run CI (Linux job included). Then open the upstream PR. Phase 0 B1/B2 still waits on the probe run (`sudo spikes/loginwindow-probe/install.sh`, grant, Fast-User-Switch). |
+| 2026-11-25 | 3 | 1, 4 | Checked upstream: 12 commits to v0.11.2, then 3 TODO-only commits (132ebdf). Multi-monitor shipped upstream, so Phase 4 is rewritten around testing it. Fast-forwarded the fork's `main` to 132ebdf; rebased `feat/access-credential` onto it (two keep-both conflicts in `conn_test.rs` and `SettingsModel.swift`, plus a silent merge of upstream's new watcher call that received the secret, fixed) and force-pushed it as e461812; 483 tests pass, fmt + clippy clean on 1.95.0, the controller type-check matches upstream's (11 diagnostics, all missing SwiftUI macros). Rebased this branch onto 132ebdf too. The startup display-asleep bug is still present upstream. #237 has a new maintainer comment (multi-user sessions are out of scope); login-screen support is still an open enhancement with no timeline. | Same as session 2 (Xcode license, live client tests, probe run for B1/B2), plus Spike C. |
