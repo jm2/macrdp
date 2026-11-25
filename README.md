@@ -88,6 +88,8 @@ First run will prompt for:
 
 Then connect from a client to `<your-mac-ip>:3390` with your Mac username and password. `mstsc` will prompt for credentials in its own NLA dialog — no need to pre-type the username.
 
+**Rather not give macrdp your Mac password?** Start it with `--auth access-credential` (or set `AUTH_MODE=access-credential` in `config.env`, or pick *Access credential* under Settings › Connection in the controller) and create a secret with `macrdp credential rotate`. Clients then sign in with that random secret. macrdp never asks for, stores or checks your Mac password, and you unlock a locked Mac at its own lock screen from the client. Leaking the secret gives someone the lock screen, not your account. It can't be combined with `--auto-unlock`, and `--lock-on-disconnect` is the recommended pairing. See [Access-credential sign-in](docs/configuration.md#access-credential-sign-in).
+
 Common flags to try next (full reference: [docs/configuration.md](docs/configuration.md)):
 
 ```bash

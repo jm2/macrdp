@@ -90,7 +90,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let blocked = running && authStatus() != nil
         statusItem.button?.alphaValue = running && !blocked ? 1.0 : 0.4
         statusItem.button?.toolTip = blocked
-            ? "macrdp: waiting for a valid password"
+            ? "macrdp: \(waitingText)"
             : running
             ? "macrdp: running (pid \(st.pid!))"
             : (st.loaded ? "macrdp: stopped" : "macrdp: not installed")
@@ -132,8 +132,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         switch text.split(separator: "\n").first.map(String.init) {
         case "wrong-password": return "The password in the Keychain is wrong"
         case "no-password": return "No password in the Keychain"
+        case "no-access-credential": return "No RDP access credential"
         default: return nil
         }
+    }
+
+    /// What the server is waiting for while it has an auth-status file.
+    var waitingText: String {
+        usesAccessCredential ? "waiting for an access credential" : "waiting for a valid password"
     }
 
     /// Most recent error worth surfacing (auth failure / port in use / panic).
@@ -141,7 +147,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for raw in logTail().reversed() {
             let line = raw.replacingOccurrences(
                 of: "\u{1b}\\[[0-9;]*m", with: "", options: .regularExpression)
-            if line.contains("authentication failed") { return "Login failed — check the account password" }
+            if line.contains("authentication failed") {
+                return usesAccessCredential
+                    ? "Login failed — check the access credential"
+                    : "Login failed — check the account password"
+            }
             if line.contains("Address already in use") { return "Port in use — another server is bound to :3390" }
             if line.contains("panicked") { return "Server crashed — see Open Logs" }
         }
@@ -159,7 +169,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let st = agentState()
         let header: String
         if !st.loaded { header = "macrdp — not installed" }
-        else if st.pid != nil, authStatus() != nil { header = "macrdp — waiting for a valid password" }
+        else if st.pid != nil, authStatus() != nil { header = "macrdp — \(waitingText)" }
         else if let pid = st.pid { header = "macrdp — running (pid \(pid))" }
         else { header = "macrdp — stopped" }
         let h = NSMenuItem(title: header, action: nil, keyEquivalent: "")
@@ -176,7 +186,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let e = NSMenuItem(title: "⚠️ \(why)", action: nil, keyEquivalent: "")
             e.isEnabled = false
             menu.addItem(e)
-            menu.addItem(item("Re-enter Password…", #selector(fixPassword)))
+            if usesAccessCredential {
+                menu.addItem(item("Create Access Credential…", #selector(fixAccessCredential)))
+            } else {
+                menu.addItem(item("Re-enter Password…", #selector(fixPassword)))
+            }
         }
         menu.addItem(.separator())
 
@@ -214,10 +228,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                   + "(or ~/Applications), then click Start again.")
             return
         }
-        if !hasKeychainPassword() {
+        ensureConfigExists()
+        if usesAccessCredential {
+            // Never the Mac password in this mode: create the access credential
+            // on first start instead.
+            if !hasAccessCredential() {
+                guard rotateAccessCredential() else { return }
+            }
+        } else if !hasKeychainPassword() {
             guard promptAndStorePassword() else { return } // user cancelled
         }
-        ensureConfigExists()
         let firstInstall = !FileManager.default.fileExists(atPath: plistURL.path)
         if firstInstall { installLaunchAgent(serverApp: serverApp) }
         ensureLoaded()
@@ -259,7 +279,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             print("plist:      \(plistURL.path)")
             print("config:     \(configURL.path)")
             print("log:        \(logURL.path)")
-            print("password:   \(hasKeychainPassword() ? "set" : "MISSING")")
+            if usesAccessCredential {
+                print("auth:       access credential (user \(rdpUsername))")
+                print("credential: \(hasAccessCredential() ? "set" : "MISSING")")
+            } else {
+                print("auth:       account password")
+                print("password:   \(hasKeychainPassword() ? "set" : "MISSING")")
+            }
             return 0
         }
         guard let serverApp = locateServerApp() else {
@@ -272,7 +298,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ensureLoaded()
         _ = run("/bin/launchctl", ["kickstart", "-k", service])
         print("installed: \(plistURL.path) -> \(serverApp.path)")
-        if !hasKeychainPassword() {
+        if usesAccessCredential {
+            if !hasAccessCredential() {
+                print("note: no access credential yet — create one with:")
+                print("  \(serverApp.path)/Contents/MacOS/macrdp --config '\(configURL.path)' credential rotate")
+            }
+        } else if !hasKeychainPassword() {
             print("note: Keychain password not set — store it with:")
             print("  security add-generic-password -U -s macrdp -a \(NSUserName()) -w '<password>'")
         }

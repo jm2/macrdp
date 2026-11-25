@@ -18,6 +18,11 @@ packaging side, see [../packaging/README.md](../packaging/README.md).
                           USE_KEYCHAIN=1, so change it to 0)
 --skip-auth               Bypass PAM (testing only)
 --keychain                Read password from macOS Keychain (service=macrdp)
+--auth MODE               How clients sign in: `account` (default; the Mac
+                          password, PAM-checked) or `access-credential` (a
+                          random secret from `macrdp credential rotate`; the Mac
+                          password is never stored or checked). Config key
+                          AUTH_MODE. See "Access-credential sign-in" below.
 -v, --verbose             Show all the noisy logs the default filter hides
 --allow-sleep             Let the Mac sleep / auto-lock normally (default
                           is to spawn `caffeinate` so an idle Mac doesn't
@@ -426,6 +431,56 @@ QoE-less clients (FreeRDP) and high-RTT links are never touched. A deeper
 ESTABLISHED_MIN_QOE, ESTABLISHED_MAX_WAIT_MS, ESTABLISHED_WALL_REPORTS}` — tolerates the
 brief zero-EDR windows a healthy client produces mid-session; see the blank-recovery
 notes in `docs/known-quirks.md` for the full story and the tuning history.
+
+## Access-credential sign-in
+
+With `--auth access-credential` (config `AUTH_MODE=access-credential`) RDP clients
+sign in with a random secret that macrdp generates, not with your Mac password.
+macrdp never asks for, stores or checks the Mac password in this mode: NLA checks
+the access credential, and when the Mac is locked you unlock it by typing your
+password at the real lock screen from the client. Leaking the access credential
+gives someone the lock screen, not your account.
+
+```
+macrdp credential rotate          # new secret: stored in the login Keychain, printed once
+macrdp credential status          # auth mode, username, whether a credential exists
+macrdp credential show-username   # the RDP username (--username, USERNAME or $USER)
+macrdp --config <config.env> credential rotate   # use USERNAME/AUTH_MODE from the file
+```
+
+- **Username:** the same account name as the server uses (`--username`,
+  `USERNAME`, or `$USER`). The secret is stored as a generic password, service
+  `macrdp-access`, account = that name; the account-password item (service
+  `macrdp`) is separate and unused.
+- **Format:** 28 characters in groups of four (`7k2m-q9vd-…`, 140 bits), from an
+  alphabet without look-alike characters. `rotate` prints only the secret on
+  stdout and its explanation on stderr, so a script or the menu-bar controller can
+  capture it.
+- **Rotation needs no restart.** `credential rotate` (which the menu-bar controller
+  also runs) rewrites `access-credential-changed` in the config directory; a running
+  server checks that file every 2 s and then re-reads the Keychain item, so new
+  connections must use the new secret within about 2 s. The server never reads the
+  Keychain on a timer, because a login keychain set to lock itself would raise an
+  unlock prompt on every read. A change made another way (Keychain Access,
+  `security`) applies at the next start. A live session stays connected. The old secret can't take it over (a validator compares every
+  client's password with the current secret), and the new one can take it over only
+  once it has ended, because IronRDP checks a takeover against the credentials
+  captured when the session began.
+- **Removing the item** (Keychain Access, or `security delete-generic-password -s
+  macrdp-access -a <user>`) takes effect at the next start. A server that starts with
+  no credential waits for one, checking every 30 s, and the menu-bar controller
+  offers to create it.
+- **Can't be combined with** `--password`, `--password-file` / `PASSWORD_FILE`,
+  `--skip-auth` or `--auto-unlock` / `AUTO_UNLOCK` (which types the Mac password
+  into the lock screen); startup stops with an error naming the setting.
+  `USE_KEYCHAIN` is ignored.
+- **Pair it with `--lock-on-disconnect`.** A session left unlocked is reachable with
+  the access credential alone, exactly as it is with the account password in the
+  default mode.
+- **Clients must delegate their credentials** in the NLA exchange, as standard
+  CredSSP does (verified with FreeRDP 3.33; mstsc and Windows App not yet verified
+  live). A client using Restricted Admin or Remote Credential Guard doesn't delegate,
+  and is refused.
 
 ## Headless mode
 

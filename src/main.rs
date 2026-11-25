@@ -9,6 +9,7 @@
 )]
 
 mod aac;
+mod access_credential;
 mod audin;
 mod audio;
 mod auth;
@@ -244,9 +245,21 @@ struct Args {
 
     /// Mac account the client authenticates as. Defaults to $USER. The
     /// password is validated against the local account via PAM (checkpw
-    /// service) at startup, so this must be a real Mac user.
+    /// service) at startup, so this must be a real Mac user. With
+    /// `--auth access-credential` it is the RDP username of the access
+    /// credential instead, and no password is checked against the account.
     #[arg(long)]
     username: Option<String>,
+
+    /// How RDP clients authenticate. `account` (default): the Mac account
+    /// password, checked with PAM at startup and stored in the Keychain or a
+    /// password file. `access-credential`: a random secret from `macrdp
+    /// credential rotate`, kept in the login Keychain; macrdp never asks for,
+    /// stores or checks the Mac password, and the remote user unlocks at the
+    /// real lock screen. Can't be combined with --password, --password-file,
+    /// --skip-auth or --auto-unlock. Config: AUTH_MODE.
+    #[arg(long, value_enum, default_value_t = access_credential::AuthMode::Account)]
+    auth: access_credential::AuthMode,
 
     /// Password to use without an interactive prompt. Discouraged and kept only
     /// for compatibility / scripted tests: a command-line password is visible to
@@ -939,6 +952,27 @@ struct Args {
     /// interface entitlement (packaging/make-app.sh PROVISION_PROFILE=...). macOS-only.
     #[arg(long = "usb-spike")]
     usb_spike: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// One-shot commands that run instead of the server.
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Manage the RDP access credential used with `--auth access-credential`.
+    /// The username comes from --username / $USER, or from USERNAME in the file
+    /// --config names, as for the server.
+    #[command(subcommand)]
+    Credential(access_credential::CredentialCommand),
+}
+
+/// The account clients authenticate as: --username, else $USER.
+fn resolve_username(args: &Args) -> Result<String> {
+    args.username
+        .clone()
+        .or_else(|| std::env::var("USER").ok())
+        .ok_or_else(|| anyhow!("no username: pass --username or set $USER"))
 }
 
 /// Prevent macOS from going to sleep, dimming/sleeping the display, idle-
@@ -2639,6 +2673,12 @@ fn args_from_config(path: &Path) -> Result<Args> {
         }
         argv.push("--keychain".into());
     }
+    // AUTH_MODE=access-credential: clients authenticate with the macrdp access
+    // credential (src/access_credential.rs). USE_KEYCHAIN is then irrelevant.
+    if let Some(mode) = cfg.get("AUTH_MODE").filter(|m| !m.is_empty()) {
+        argv.push("--auth".into());
+        argv.push(mode.clone());
+    }
     if on("ENABLE_H264", false) {
         argv.push("--enable-h264".into());
     }
@@ -2966,15 +3006,26 @@ fn report_auth_failure(
     username: &str,
     status_dir: &Option<PathBuf>,
 ) {
-    error!(
-        error = format!("{err:#}"),
-        reason = failure.code(),
-        user = %username,
-        "cannot start: no valid password for this Mac account. Waiting, and checking \
-         again only when the stored password changes, so the account doesn't collect \
-         failed logins. Re-enter it in the macrdp menu-bar controller, or fix the \
-         Keychain entry"
-    );
+    if failure == auth_status::Failure::NoAccessCredential {
+        error!(
+            error = format!("{err:#}"),
+            reason = failure.code(),
+            user = %username,
+            "cannot start: no RDP access credential. Waiting, and checking the Keychain \
+             again every 30 s. Create one in the macrdp menu-bar controller or with \
+             `macrdp credential rotate`"
+        );
+    } else {
+        error!(
+            error = format!("{err:#}"),
+            reason = failure.code(),
+            user = %username,
+            "cannot start: no valid password for this Mac account. Waiting, and checking \
+             again only when the stored password changes, so the account doesn't collect \
+             failed logins. Re-enter it in the macrdp menu-bar controller, or fix the \
+             Keychain entry"
+        );
+    }
     if let Some(dir) = status_dir.as_deref() {
         if let Err(e) = auth_status::write(dir, failure, username) {
             warn!(error = %e, "could not write the auth-status file for the controller");
@@ -3012,6 +3063,8 @@ fn spawn_autodetect_ticker(
 
 async fn async_main() -> Result<()> {
     let mut args = Args::parse();
+    // Taken before `--config` rebuilds Args from the file, which would drop it.
+    let command = args.command.take();
     // Where the auth-status file goes for the controller (#266): beside the
     // config file when there is one, else the default config directory.
     let status_dir: Option<PathBuf> = args
@@ -3023,6 +3076,14 @@ async fn async_main() -> Result<()> {
     // sole source of truth — rebuild Args from it.
     if let Some(cfg_path) = args.config.clone() {
         args = args_from_config(&cfg_path)?;
+    }
+    if let Some(Command::Credential(cmd)) = command {
+        return access_credential::run_command(
+            cmd,
+            &resolve_username(&args)?,
+            args.auth,
+            status_dir.as_deref(),
+        );
     }
 
     // Research spike (Phase-1b USB-redirection go/no-go): run the UserHCI probe
@@ -3287,14 +3348,24 @@ async fn async_main() -> Result<()> {
     // wrong password costs nothing but the check itself. Under launchd a failure
     // does not exit: KeepAlive would restart it every ~10 s, each restart another
     // failed check against the Mac account. See src/auth_status.rs.
-    let username = args
-        .username
-        .clone()
-        .or_else(|| std::env::var("USER").ok())
-        .ok_or_else(|| anyhow!("no username: pass --username or set $USER"))?;
+    let username = resolve_username(&args)?;
+    // --auth access-credential: NLA checks a random access credential from the
+    // Keychain and the Mac password is never read or checked (see
+    // src/access_credential.rs).
+    let access_mode = args.auth == access_credential::AuthMode::AccessCredential;
+    if access_mode {
+        if let Some(why) = access_credential::conflicting_setting(
+            args.password.is_some(),
+            args.password_file.is_some(),
+            args.skip_auth,
+            args.auto_unlock,
+        ) {
+            return Err(anyhow!("{why}"));
+        }
+    }
     // Only the Keychain and a password file can change while we wait; the
     // terminal prompt and --password are one-shot, so they never wait.
-    let pollable = args.keychain || args.password_file.is_some();
+    let pollable = access_mode || args.keychain || args.password_file.is_some();
     let park = pollable
         && auth_status::should_park(
             std::io::stdout().is_terminal(),
@@ -3307,7 +3378,17 @@ async fn async_main() -> Result<()> {
     let mut rejected: Option<Zeroizing<String>> = None;
     let mut reported: Option<auth_status::Failure> = None;
     let password: Zeroizing<String> = loop {
-        let read: Result<Zeroizing<String>> = if args.keychain {
+        let read: Result<Zeroizing<String>> = if access_mode {
+            match access_credential::read(&username) {
+                Ok(access_credential::Stored::Found(secret)) => Ok(secret),
+                Ok(access_credential::Stored::Missing) => Err(anyhow!(
+                    "no access credential in the Keychain for {username} (service \"{}\"); \
+                     create one with `macrdp credential rotate`",
+                    access_credential::KEYCHAIN_SERVICE
+                )),
+                Err(e) => Err(e),
+            }
+        } else if args.keychain {
             read_password_from_keychain(&username)
         } else if let Some(path) = args.password_file.as_deref() {
             read_password_file(path)
@@ -3324,7 +3405,10 @@ async fn async_main() -> Result<()> {
                 .context("read password from terminal")
         };
         let (failure, err) = match read {
+            Err(e) if access_mode => (auth_status::Failure::NoAccessCredential, e),
             Err(e) => (auth_status::Failure::NoPassword, e),
+            // No account check: NLA compares the access credential itself.
+            Ok(p) if access_mode => break p,
             Ok(p) => {
                 if !auth_status::should_check(rejected.as_ref().map(|r| r.as_str()), &p) {
                     // Same password the check already rejected: no new check,
@@ -3367,6 +3451,24 @@ async fn async_main() -> Result<()> {
     if reported.is_some() {
         info!(user = %username, "a valid password is available now — starting");
     }
+    if access_mode {
+        info!(
+            user = %username,
+            "auth: access credential (--auth access-credential) — NLA checks the macrdp \
+             access credential; the Mac password is never stored or checked, so the remote \
+             user unlocks at the real lock screen"
+        );
+        if !args.lock_on_disconnect {
+            info!(
+                "a session left unlocked is reachable with the access credential alone; \
+                 --lock-on-disconnect is the recommended pairing"
+            );
+        }
+    }
+    // The access credential the server accepts, shared with the validator and
+    // the rotation watcher; None in account mode.
+    let access_current = access_mode
+        .then(|| access_credential::CurrentSecret::new(Zeroizing::new((*password).clone())));
     // Arc'd so the reconnect-time auto-unlock watcher (below) can reuse this
     // exact validated credential without a second Keychain read — works
     // identically regardless of which branch above produced it.
@@ -3493,10 +3595,17 @@ async fn async_main() -> Result<()> {
     // additionally skipped entirely under --skip-auth, since in that mode
     // `password` was never validated by PAM and isn't trustworthy to
     // auto-type (see attempt_auto_unlock's docs).
-    let auto_unlock = args.auto_unlock && !args.skip_auth;
+    // access_mode already refused --auto-unlock at startup; checked again here so
+    // the access credential can never reach the lock screen.
+    let auto_unlock = args.auto_unlock && !args.skip_auth && !access_mode;
     if args.auto_unlock && args.skip_auth {
         warn!("--auto-unlock has no effect under --skip-auth; ignoring");
     }
+    let unlock_password: Arc<Zeroizing<String>> = if access_mode {
+        Arc::new(Zeroizing::new(String::new()))
+    } else {
+        Arc::clone(&password)
+    };
     if args.detach_primary {
         let vd_id = virtual_display
             .as_ref()
@@ -3513,7 +3622,7 @@ async fn async_main() -> Result<()> {
             args.restore_windows_on_disconnect,
             physical_main_id,
             lock_activity.clone(),
-            Arc::clone(&password),
+            Arc::clone(&unlock_password),
             auto_unlock,
         );
     } else if args.capture_primary {
@@ -3532,7 +3641,7 @@ async fn async_main() -> Result<()> {
             args.restore_windows_on_disconnect,
             physical_main_id,
             lock_activity.clone(),
-            Arc::clone(&password),
+            Arc::clone(&unlock_password),
             auto_unlock,
         );
     } else if args.shield_primary {
@@ -3551,7 +3660,7 @@ async fn async_main() -> Result<()> {
             args.restore_windows_on_disconnect,
             physical_main_id,
             lock_activity.clone(),
-            Arc::clone(&password),
+            Arc::clone(&unlock_password),
             auto_unlock,
         );
     } else if args.virtual_display && args.restore_windows_on_disconnect {
@@ -3576,7 +3685,7 @@ async fn async_main() -> Result<()> {
             true,
             physical_main_id,
             None,
-            Arc::clone(&password),
+            Arc::clone(&unlock_password),
             false,
         );
         if args.make_primary {
@@ -4316,6 +4425,17 @@ async fn async_main() -> Result<()> {
         password: (**password).clone(),
         domain: None,
     }));
+    if let Some(current) = access_current {
+        server.set_credential_validator(Some(Arc::new(
+            access_credential::AccessCredentialValidator::new(current.clone()),
+        )));
+        access_credential::spawn_rotation_watcher(
+            username.clone(),
+            current,
+            server.handle().clone(),
+            status_dir.clone(),
+        );
+    }
 
     info!(
         addr = %args.bind,
@@ -4516,6 +4636,56 @@ mod config_tests {
         ));
         fs::write(&path, body).unwrap();
         path
+    }
+
+    #[test]
+    fn auth_mode_comes_from_config_and_defaults_to_account() {
+        use access_credential::AuthMode;
+        let parse = |name: &str, body: &str| {
+            let p = write_temp(name, body);
+            let r = args_from_config(&p);
+            fs::remove_file(&p).ok();
+            r
+        };
+        assert_eq!(
+            parse("auth-default", "USERNAME=alice\n").unwrap().auth,
+            AuthMode::Account
+        );
+        let a = parse("auth-access", "AUTH_MODE=access-credential\n").unwrap();
+        assert_eq!(a.auth, AuthMode::AccessCredential);
+        // USE_KEYCHAIN still defaults on; access-credential mode ignores it.
+        assert!(a.keychain);
+        assert_eq!(
+            parse("auth-account", "AUTH_MODE=account\n").unwrap().auth,
+            AuthMode::Account
+        );
+        assert_eq!(
+            parse("auth-empty", "AUTH_MODE=\n").unwrap().auth,
+            AuthMode::Account
+        );
+        assert!(parse("auth-bad", "AUTH_MODE=pin\n").is_err());
+    }
+
+    #[test]
+    fn credential_subcommand_parses_alongside_server_flags() {
+        let a =
+            Args::try_parse_from(["macrdp", "--username", "bob", "credential", "rotate"]).unwrap();
+        assert_eq!(a.username.as_deref(), Some("bob"));
+        assert!(matches!(
+            a.command,
+            Some(Command::Credential(
+                access_credential::CredentialCommand::Rotate
+            ))
+        ));
+        let a = Args::try_parse_from(["macrdp", "credential", "show-username"]).unwrap();
+        assert!(matches!(
+            a.command,
+            Some(Command::Credential(
+                access_credential::CredentialCommand::ShowUsername
+            ))
+        ));
+        assert!(Args::try_parse_from(["macrdp"]).unwrap().command.is_none());
+        assert!(Args::try_parse_from(["macrdp", "credential"]).is_err());
     }
 
     #[test]

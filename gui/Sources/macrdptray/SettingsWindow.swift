@@ -245,7 +245,8 @@ private struct ConnectionTab: View {
                             a.messageText = "Allow connections from the network?"
                             a.informativeText = "macrdp will listen on all interfaces (0.0.0.0), so other "
                                 + "devices on your network can connect. Access still requires TLS and your "
-                                + "macOS account password — enable only on a network you trust."
+                                + (model.usesAccessCredential ? "RDP access credential" : "macOS account password")
+                                + " — enable only on a network you trust."
                             a.addButton(withTitle: "Allow")
                             a.addButton(withTitle: "Cancel")
                             NSApp.activate(ignoringOtherApps: true)
@@ -268,13 +269,31 @@ private struct ConnectionTab: View {
                     + "slow” on a fast network.")
                     .font(.caption).foregroundColor(.secondary)
             }
-            Section("Account") {
-                Button(model.controller.hasKeychainPassword()
-                    ? "Change Account Password…" : "Set Account Password…") {
-                    model.controller.setPassword()
+            Section("Sign-in") {
+                Picker("RDP clients sign in with", selection: Binding(
+                    get: { model.usesAccessCredential ? AccessCredential.modeValue : "account" },
+                    set: { model.setString("AUTH_MODE", $0) })) {
+                    Text("Mac account password").tag("account")
+                    Text("Access credential").tag(AccessCredential.modeValue)
                 }
-                Text("Stored in your login Keychain; RDP clients authenticate against your Mac account.")
-                    .font(.caption).foregroundColor(.secondary)
+                if model.usesAccessCredential {
+                    Button(model.controller.hasAccessCredential()
+                        ? "New Access Credential…" : "Create Access Credential…") {
+                        model.controller.rotateAccessCredential()
+                    }
+                    Text("Clients sign in as “\(model.controller.rdpUsername)” with a random secret macrdp "
+                        + "generates and shows once. Your Mac password is never asked for or stored: "
+                        + "when the Mac is locked, unlock it at the lock screen from your RDP client. "
+                        + "Automatic unlock isn't available in this mode.")
+                        .font(.caption).foregroundColor(.secondary)
+                } else {
+                    Button(model.controller.hasKeychainPassword()
+                        ? "Change Account Password…" : "Set Account Password…") {
+                        model.controller.setPassword()
+                    }
+                    Text("Stored in your login Keychain; RDP clients authenticate against your Mac account.")
+                        .font(.caption).foregroundColor(.secondary)
+                }
             }
             Section("Quick setup") {
                 Button("Set Up Remote Desktop preset") { model.applyRemoteDesktopPreset() }
@@ -392,9 +411,13 @@ private struct DisplayTab: View {
                     .disabled(!headless)
                 Toggle("Unlock it automatically when a client reconnects",
                        isOn: model.boolBinding("AUTO_UNLOCK"))
-                    .disabled(!headless)
+                    .disabled(!headless || model.usesAccessCredential)
                 if !headless {
                     Text("Needs one of the Detach/Blank modes above.")
+                        .font(.caption).foregroundColor(.secondary)
+                } else if model.usesAccessCredential {
+                    Text("Automatic unlock needs your Mac password, which access-credential sign-in "
+                        + "never stores. Unlock at the lock screen from your RDP client instead.")
                         .font(.caption).foregroundColor(.secondary)
                 } else if model.bool("LOCK_ON_DISCONNECT") && !model.bool("AUTO_UNLOCK") {
                     Text("Without automatic unlock you'll need to be at the Mac to unlock it — "
