@@ -9,6 +9,12 @@ This replaces the earlier from-scratch `macrdp-PLAN.md`.
 
 > Fork-only file: `docs/fork/` and `spikes/` live on the fork's `feat/*` branches and are
 > never part of an upstream PR.
+>
+> **Target platform (decided 2026-11-24):** macOS **27.2.1 on Apple silicon** (mbp16-m1max)
+> is the real-world target. Spikes and live verification run there; behaviour on macOS 26
+> and 15 is *inferred* from it (API availability, Apple's release notes), not tested, unless
+> a spike turns up a version-specific dependency. Where this plan says "macOS 15 and 26",
+> read "macOS 27, with 26/15 inferred".
 
 ---
 
@@ -186,8 +192,8 @@ with real clients.
       *(2026-11-24: fork and `upstream` remote in place, `main` == upstream f46bfd9, Actions
       enabled on the fork with upstream's workflows unchanged.)*
 - [ ] **Spike B1 — LoginWindow capture:** a minimal signed binary launched by a
-      `/Library/LaunchAgents` plist with `LimitLoadToSessionType = LoginWindow`, on macOS 15
-      and 26. Which capture path works there: ScreenCaptureKit, `CGDisplayStream`, or
+      `/Library/LaunchAgents` plist with `LimitLoadToSessionType = LoginWindow`, on macOS 27
+      (26/15 inferred). Which capture path works there: ScreenCaptureKit, `CGDisplayStream`, or
       `CGWindowListCreateImage`? Record the running uid and how TCC treats it.
       *(Probe built: `spikes/loginwindow-probe/`. Not yet run in a login-window session.)*
 - [ ] **Spike B2 — LoginWindow input:** from the same agent, can `CGEventPost` type into the
@@ -201,8 +207,8 @@ with real clients.
 - [ ] **Spike C — handover and reconnect:** a root daemon passes an accepted socket to the user
       instance and to the LoginWindow instance. Measure the server-initiated reconnect on a
       console switch with mstsc (antec-win), Windows App (macOS), FreeRDP 3, and Transom.
-- [ ] **Spike D — FileVault on macOS 26 (Apple silicon):** in a FileVault-on macOS 26 guest or
-      spare Mac with Remote Login on, reboot, then SSH-unlock. Record: (1) whether the network
+- [ ] **Spike D — FileVault on macOS 27 (Apple silicon):** on mbp16-m1max (FileVault on,
+      Remote Login on) or a FileVault-on guest, reboot, then SSH-unlock. Record: (1) whether the network
       stays up after unlock with nobody logged in, on Ethernet and on WPA2-Personal Wi-Fi;
       (2) whether the Mac lands at the login window or logs the unlocking user in; (3) whether
       the LoginWindow agent starts and can capture and inject input; (4) time from SSH unlock
@@ -221,17 +227,24 @@ with real clients.
   login window really is out of reach: stop after Phase 1 and say so on #237.
 
 ### Phase 1 — Access-credential mode (≈1–2 weeks; independent of Phase 0's outcome)
-- [ ] `--auth access-credential` (config `AUTH_MODE=access-credential`): skip the PAM check;
+- [x] `--auth access-credential` (config `AUTH_MODE=access-credential`): skip the PAM check;
       IronRDP `Credentials` come from the access credential. Default stays `account`.
-- [ ] `macrdp credential rotate|show-username|status`; random secret shown once; Keychain item
-      separate from anything the account-password flow uses.
-- [ ] Tray: in this mode, replace "Set Account Password…" with "Access credential…" (rotate,
-      copy once). No Mac-password prompt anywhere in this mode.
-- [ ] `--auto-unlock` hard-errors in this mode, with a message explaining why.
+      *(Branch `feat/access-credential` 033b5ad, off upstream f46bfd9. Plus a
+      `CredentialValidator` against the current secret: see §11, session 2.)*
+- [x] `macrdp credential rotate|show-username|status`; random secret shown once; Keychain item
+      separate from anything the account-password flow uses. *(Service `macrdp-access`;
+      140-bit secret; stored via `security -i` on stdin; rotation applies within ~2 s through
+      a stamp file, no restart.)*
+- [x] Tray: in this mode, replace "Set Account Password…" with "Access credential…" (rotate,
+      copy once). No Mac-password prompt anywhere in this mode. *(Written and type-checked;
+      not yet built or clicked through: the build needs `sudo xcodebuild -license`.)*
+- [x] `--auto-unlock` hard-errors in this mode, with a message explaining why.
 - [ ] Live-verify: lock, reconnect, and type the password at the lock screen from mstsc and
       Transom (non-US layout too, given upstream's keymap notes).
-- [ ] Docs: README section, `docs/configuration.md`, security trade-offs; the README "Recent
-      releases" convention from upstream's `CLAUDE.md`.
+- [x] Docs: README section, `docs/configuration.md`, security trade-offs; the README "Recent
+      releases" convention from upstream's `CLAUDE.md`. *(README, configuration, cli,
+      features, architecture, gotchas, known-quirks, config.env.example. "Recent releases" is
+      updated at a release cut, so not in this PR.)*
 - [ ] Open the upstream PR.
 - **DoD:** a fresh install in this mode never asks for or stores the Mac password, and a remote
   user unlocks via the real lock screen.
@@ -253,8 +266,8 @@ with real clients.
 - [ ] `macrdp doctor` (system mode) reports FileVault state, Remote Login state, the network
       type (with a warning for unsupported pre-unlock Wi-Fi), and the screen-recording approval
       state. Docs: a "Headless Macs and reboots" page covering §3a.
-- **DoD:** both scenarios pass with mstsc and Transom, with nobody at the Mac. The FileVault-off
-  one passes on macOS 15 and 26; the FileVault-on one on macOS 26 Apple silicon.
+- **DoD:** both scenarios pass with mstsc and Transom, with nobody at the Mac, on macOS 27
+  Apple silicon (26/15 inferred; see the target note at the top).
 
 ### Phase 3 — Console following and polish (≈1–2 weeks)
 - [ ] Fast user switching (user A → login window → user B), each with its own instance.
@@ -287,8 +300,12 @@ with real clients.
   path may need real Apple silicon hardware if guests can't do the pre-boot SSH unlock
   (Spike D); re-imaging macmini-m1 to macOS 26 is one option.
   *(2026-11-24: mbp16-m1max actually runs **macOS 27.2.1** (build 26B131), with FileVault on
-  and Remote Login + Screen Sharing enabled. No VM tooling (UTM, tart) is installed and there
-  is no code-signing identity in the keychain, so the probe is ad-hoc signed.)*
+  and Remote Login + Screen Sharing enabled, and that is now the target (see the note at the
+  top). No VM tooling (UTM, tart) is installed and there is no code-signing identity in the
+  keychain, so the probe is ad-hoc signed. `xcode-select` points at the Command Line Tools,
+  which lack SwiftUI's macro plugins, and Xcode.app's license isn't accepted, so the GUI
+  can't be built here until someone runs `sudo xcodebuild -license`. The local Rust is 1.98;
+  CI pins 1.95.0 (installed via rustup for parity: run fmt/clippy with `+1.95.0`).)*
 - **Clients:** Transom and FreeRDP 3 on antec; mstsc on antec-win; Windows App on macOS.
 
 ## 9. Fallbacks if upstream says no
@@ -306,8 +323,32 @@ with real clients.
 4. Whether system mode should also be offered for the default account mode (it can't
    auto-unlock at the login window either way).
 
+## 10a. Findings worth carrying forward
+
+- **macrdp can't start while the Mac is locked with its displays asleep** (mirror-primary
+  mode). `capture::primary_display_size` asks ScreenCaptureKit for the display size at startup
+  even with `--width`/`--height`, SCK lists no displays then (as upstream's #231 note says),
+  and startup fails with `no displays available`. Under launchd that's a KeepAlive restart
+  loop until the display wakes. The LoginWindow instance (Phase 2) will start at boot with the
+  display possibly asleep, so it needs the size query to tolerate this (fall back to
+  `--width/--height`, or wake the display first as `display_awake.rs` does for clients). Found
+  2026-11-24 while live-testing Phase 1; worth an upstream issue.
+- **IronRDP authenticates takeover candidates against the credentials captured when the live
+  session began** (`RdpServerHandle::set_credentials` docs; its own comment says "UNTESTED").
+  After a credential change the old password can still evict the session unless a
+  `CredentialValidator` checks the current one, and the new password can't take it over until
+  it ends. Pinned in `src/conn_test.rs` on `feat/access-credential`. This matters again in
+  Phase 2: a console switch is exactly a "credential context changed under a live session"
+  event. Possibly worth an upstream IronRDP test/doc PR.
+- **The validator needs delegated credentials.** With a validator set, IronRDP refuses a client
+  that completes NLA without delegating credentials (Restricted Admin / Remote Credential
+  Guard). FreeRDP 3.33 delegates; mstsc, Windows App and Transom are still to be checked.
+- **FreeRDP `/auth-only`** is a good scripted NLA probe, but `sdl-freerdp` exits 1 even on
+  success: read its `Authentication only, ERRBASE_SUCCESS` log line instead.
+
 ## 11. Progress log
 
 | Date | Session | Phase | Summary | Next |
 |---|---|---|---|---|
 | 2026-11-24 | 1 | 0 | Fork setup done (`upstream` remote added; `main` == upstream f46bfd9; branch `feat/loginwindow-phase0`). Built the B1/B2 probe (`spikes/loginwindow-probe/`): a Swift LaunchAgent that records uid, security session, CGSession, TCC preflights and code signature, tries six capture paths (SCK content/screenshot/stream, CGDisplayStream, CGDisplayCreateImage, CGWindowListCreateImage, `screencapture`), runs a net-zero type/erase per event tap at the login window, and exposes a token-gated loopback command socket (`ctl.sh`). Smoke-tested from the user session while the Mac was locked with its display asleep: SCK lists no displays, and the CoreGraphics paths return black frames (as upstream's #231 note says), so the capture code is only validated end to end once it runs against an awake screen. Found that upstream IronRDP already provides `ConnectionSource`/`serve` and `ServerRedirectionHandle` (see §4), which shrinks Option L's hooks 2 and 4. | User: `build.sh`, `sudo install.sh`, grant Screen Recording + Accessibility, Fast-User-Switch to the login window for ≥60 s, log back in. Then analyse `latest-loginwindow/`, drive Return with a throwaway test account, and write up B1/B2. |
+| 2026-11-24 | 2 | 1 | Target set to macOS 27.2.1 (26/15 inferred). Phase 1 implemented on `feat/access-credential` (033b5ad, off upstream f46bfd9, pushed to the fork): `--auth access-credential` / `AUTH_MODE`, `macrdp credential rotate\|status\|show-username`, Keychain item `macrdp-access` written through `security -i` on stdin, stamp-file rotation with no restart and no Keychain polling, a validator against the current secret (closes the takeover gap in §10a), `--auto-unlock`/`--password`/`--password-file`/`--skip-auth` refused, the new `no-access-credential` status, controller sign-in picker + show-once dialog, and docs. 459 tests pass, including NLA rotation/takeover tests (mutation-checked); fmt + clippy clean on 1.95.0. Live on this Mac with FreeRDP 3.33 over NLA: the current secret is accepted; wrong, rotated-out and removed ones are refused; rotation applies within 3 s via `config.env`. | User: accept the Xcode license (`sudo xcodebuild -license`) so the controller can be built and clicked through; live-verify with mstsc, Windows App and Transom (sign in, lock, unlock at the lock screen, rotate); decide on a fork-internal draft PR to run CI (Linux job included). Then open the upstream PR. Phase 0 B1/B2 still waits on the probe run (`sudo spikes/loginwindow-probe/install.sh`, grant, Fast-User-Switch). |
