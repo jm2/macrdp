@@ -16,6 +16,8 @@ mod auth;
 mod auth_guard;
 mod auth_status;
 mod avc444;
+#[cfg(unix)]
+mod broker_source;
 mod camera;
 mod capture;
 #[cfg(target_os = "macos")]
@@ -952,6 +954,15 @@ struct Args {
     /// interface entitlement (packaging/make-app.sh PROVISION_PROFILE=...). macOS-only.
     #[arg(long = "usb-spike")]
     usb_spike: bool,
+
+    /// (Fork spike C) Take accepted connections from the broker at this Unix
+    /// socket path instead of binding --bind. See src/broker_source.rs.
+    #[arg(long, value_name = "PATH", hide = true)]
+    listen_from_broker: Option<PathBuf>,
+
+    /// (Fork spike C) The name this instance registers with the broker.
+    #[arg(long, value_name = "NAME", default_value = "aqua", hide = true)]
+    broker_instance: String,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -4444,6 +4455,20 @@ async fn async_main() -> Result<()> {
         args.bind.port(),
         username,
     );
+    #[cfg(unix)]
+    if let Some(path) = args.listen_from_broker.as_deref() {
+        let mut source = broker_source::connect(
+            path,
+            &args.broker_instance,
+            broker_source::MoveHandles {
+                redirect: server.server_redirection_handle(),
+                disconnect: server.error_info_disconnect_handle(),
+                events: server.event_sender().clone(),
+            },
+        )?;
+        info!(socket = %path.display(), instance = %args.broker_instance, "(spike) serving connections from the broker; --bind is not used");
+        return Ok(server.serve(&mut source).await?);
+    }
     Ok(server.run().await?)
 }
 
