@@ -3,6 +3,19 @@
 ```
 src/main.rs       CLI, TCC preflight, TLS cert mgmt, RdpServer assembly
 src/auth.rs       Startup PAM auth against the macOS account (libpam FFI)
+src/access_credential.rs  Access-credential sign-in (--auth access-credential,
+                  config AUTH_MODE): NLA checks a random secret from `macrdp
+                  credential rotate` (login Keychain, service macrdp-access, via
+                  /usr/bin/security on both ends; written through `security -i` on
+                  stdin) and the Mac password is never stored or checked. Owns the
+                  `credential` subcommand, the secret format, a CredentialValidator
+                  that compares against the CURRENT secret (so after a rotation the
+                  old one can't take over a live session, which IronRDP checks
+                  against the credentials captured when it began), and the watcher
+                  that applies a rotation without a restart: `rotate` rewrites a
+                  stamp file in the config dir and the server re-reads the
+                  Keychain only when it changes (never on a timer, which could
+                  raise unlock prompts). Off by default; account mode is unchanged.
 src/auth_guard.rs Connection-level auth hardening (Tier 1.2): per-source-IP
                   rate-limiting + escalating auto-expiring lockout + a greppable
                   `macrdp::audit` log, in front of the NLA/CredSSP gate. Pure,
@@ -360,7 +373,7 @@ vendor/macrdp-rdpeudp/   NEW sans-I/O crate (added 2026-06-25) for RDP UDP
 
 Cross-cutting:
 - **TLS** terminates inside the acceptor; `rustls` with, by default, a self-signed cert at `~/Library/Application Support/macrdp/{cert,key}.pem` (generated on first run, persisted thereafter for stable client TOFU). **An operator can supply a real CA / ACME cert via `--cert`/`--key` (or `TLS_CERT`/`TLS_KEY`)** — `make_tls_acceptor` then loads exactly those PEM files and never silently self-signs (a missing/bad file is a hard error; it also warns at startup if the cert is expired / within 14 days). Both the self-signed and operator paths flow through the same `load_pem_cert_and_key` → so the rest is identical. `RdpServerSecurity::Hybrid` is used so the negotiation response advertises CredSSP — the public-key bytes handed to ironrdp are the raw `subjectPublicKey` BIT STRING from the X.509 cert (not the SPKI sequence, not the keypair-derived bytes), since that's what sspi hashes client-side. The same loaded cert/key also secure the UDP multitransport (TLS for the reliable flow, DTLS for the lossy flow), so operator certs apply there too.
-- **Auth** at startup: `--username` (defaults to `$USER`) + interactive password prompt → PAM `checkpw` service → set as the static credential ironrdp_server checks per-connection. `--skip-auth` bypasses for dev.
+- **Auth** at startup: `--username` (defaults to `$USER`) + interactive password prompt → PAM `checkpw` service → set as the static credential ironrdp_server checks per-connection. `--skip-auth` bypasses for dev. With `--auth access-credential` there is no PAM check: the static credential is the access credential from the Keychain, a validator re-checks every client's password against the current one, and a watcher applies rotations live (`src/access_credential.rs`).
 - **Session model** — by default macrdp attaches to the console session of the logged-in user (single session, mirrors the primary panel). With `--virtual-display --width W --height H`, the server instead allocates a headless `CGVirtualDisplay` and serves *that*; the local Mac screen is untouched and the remote sees its own desktop at the requested resolution. The CG-side display is owned by `main()`'s scope, registered via `[CGVirtualDisplay initWithDescriptor:]` + `applySettings:`, and torn down on normal exit (signal-driven `std::process::exit(0)` skips Drop, but macOS reaps the registration when the owning process dies). Capture / input / cursor all parameterize on `(displayID, origin_pts, size_pts)` so they target the right surface regardless of which path is in effect.
 - **Process model — single-process.** One `macrdp` process does everything (accept → capture/encode/serve) for the lifetime of the server. Under launchd it IS the job (KeepAlive watches it). It owns all persistent state directly: the virtual display, headless blanking (`--capture-primary`/`--detach-primary`, engaged on first connect, process-scoped so it auto-restores on process death), `caffeinate`, and the app-switcher HUD helper. (An earlier `--fork-workers` model that fork+exec'd a fresh worker process per connection — xrdp's model, to dodge mstsc's EGFX reconnect-blank — was removed once the server learned to self-heal that blank in place via a bare core Deactivation–Reactivation; see the H.264 reconnect-blank quirk.)
 - **Signal handling** — `main.rs` spawns a task that awaits SIGINT/SIGTERM and `std::process::exit(0)`s. Without it, ScreenCaptureKit's framework threads can leave the process unkillable by Ctrl-C once an SCStream is active.

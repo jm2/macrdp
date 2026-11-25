@@ -206,6 +206,11 @@ fn server_tls_acceptor() -> tokio_rustls::TlsAcceptor {
 /// (no CredSSP). Field set mirrors IronRDP's own `examples/screenshot.rs` for
 /// this pinned rev.
 fn client_config(width: u16, height: u16) -> Config {
+    client_config_with_password(width, height, "test")
+}
+
+/// [`client_config`], sending `password` instead of the default.
+fn client_config_with_password(width: u16, height: u16, password: &str) -> Config {
     use ironrdp_pdu::gcc::{ConnectionType, KeyboardType};
     use ironrdp_pdu::rdp::capability_sets::MajorPlatformType;
     use ironrdp_pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
@@ -213,7 +218,7 @@ fn client_config(width: u16, height: u16) -> Config {
     Config {
         credentials: Credentials::UsernamePassword {
             username: "test".to_owned(),
-            password: "test".to_owned(),
+            password: password.to_owned(),
         },
         domain: None,
         enable_tls: true,
@@ -411,6 +416,29 @@ where
 {
     let (result, framed) =
         connect_client_with_config(client_io, client_config(client_w, client_h), cookie).await?;
+    Ok((
+        (result.desktop_size.width, result.desktop_size.height),
+        framed,
+    ))
+}
+
+/// [`connect_client_with_cookie`], sending `password` in the Client Info PDU.
+async fn connect_client_full<S>(
+    client_io: S,
+    client_w: u16,
+    client_h: u16,
+    cookie: Option<ServerAutoReconnect>,
+    password: &str,
+) -> anyhow::Result<((u16, u16), TokioFramed<tokio_rustls::client::TlsStream<S>>)>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync + 'static,
+{
+    let (result, framed) = connect_client_with_config(
+        client_io,
+        client_config_with_password(client_w, client_h, password),
+        cookie,
+    )
+    .await?;
     Ok((
         (result.desktop_size.width, result.desktop_size.height),
         framed,
@@ -2484,4 +2512,298 @@ async fn network_autodetect_reports_the_connect_time_bandwidth() -> anyhow::Resu
         "the result carried no connect-time bandwidth: {bandwidth:?}"
     );
     Ok(())
+}
+
+// ---- access-credential mode (src/access_credential.rs) ----------------------
+
+/// A server as `main.rs` builds it under `--auth access-credential`: the macrdp
+/// validator over `current`, plus a live-session sound factory so a served
+/// connection stays up. No static credentials: this harness is TLS-only, so
+/// the client's password arrives in the Client Info PDU and only the validator
+/// judges it (with NLA it would judge the delegated CredSSP credentials).
+fn build_access_credential_server(
+    port: u16,
+    current: crate::access_credential::CurrentSecret,
+) -> RdpServer {
+    let mut server =
+        build_test_server_full(port, 1024, 768, false, None, crate::bitmap_codecs(), true);
+    server.set_credential_validator(Some(Arc::new(
+        crate::access_credential::AccessCredentialValidator::new(current),
+    )));
+    server
+}
+
+/// Whether the server kept a session for a client sending `password`. A denied
+/// client may count itself connected before the server's check runs, so a
+/// handshake that completes but is then closed counts as refused.
+async fn kept_session<S>(
+    io: S,
+    password: &str,
+) -> Option<TokioFramed<tokio_rustls::client::TlsStream<S>>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync + 'static,
+{
+    let (_, mut framed) = connect_client_full(io, 1024, 768, None, password)
+        .await
+        .ok()?;
+    stays_open(&mut framed, std::time::Duration::from_millis(700))
+        .await
+        .ok()
+        .map(|()| framed)
+}
+
+/// A rotation takes effect on the next connection: the old secret is refused
+/// and the new one accepted, with no server restart.
+#[tokio::test]
+async fn a_rotated_access_credential_refuses_the_old_secret() -> anyhow::Result<()> {
+    use crate::access_credential::CurrentSecret;
+    use anyhow::Context as _;
+    init_tracing();
+
+    let current = CurrentSecret::new(zeroize::Zeroizing::new("old-secret".into()));
+    let rotate_to = current.clone();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let mut server = build_access_credential_server(3389, current);
+            let steps = [
+                ("old-secret", None, true),
+                ("wrong", None, false),
+                ("old-secret", Some("new-secret"), false),
+                ("new-secret", None, true),
+            ];
+            for (i, (password, rotate, expect_kept)) in steps.into_iter().enumerate() {
+                if let Some(new) = rotate {
+                    rotate_to.replace(Some(zeroize::Zeroizing::new(new.into())));
+                }
+                let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+                let task = tokio::task::spawn_local(async move {
+                    let _ = server.run_connection(server_io).await;
+                    server
+                });
+                let kept = kept_session(client_io, password).await;
+                assert_eq!(
+                    kept.is_some(),
+                    expect_kept,
+                    "step {i}: password {password:?}"
+                );
+                drop(kept); // closes the session so run_connection returns
+                server = task
+                    .await
+                    .with_context(|| format!("server task, step {i}"))?;
+            }
+            anyhow::Ok(())
+        })
+        .await
+}
+
+// ---- the same, over NLA (CredSSP), as macrdp always serves ------------------
+
+/// A Kerberos-free network client: NTLM needs no network, and anything that
+/// tries it gets an error rather than a panic.
+struct NoNetworkError;
+impl ironrdp_tokio::NetworkClient for NoNetworkError {
+    async fn send(&mut self, _req: &NetworkRequest) -> ConnectorResult<Vec<u8>> {
+        Err(ironrdp_connector::general_err!("no network in this test"))
+    }
+}
+
+/// A TLS acceptor plus the raw `subjectPublicKey` CredSSP binds to (the same
+/// bytes `main.rs::make_tls_acceptor` hands `with_hybrid`).
+fn server_tls_acceptor_with_public_key() -> (tokio_rustls::TlsAcceptor, Vec<u8>) {
+    use rcgen::{generate_simple_self_signed, CertifiedKey};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use x509_cert::der::Decode as _;
+
+    let CertifiedKey { cert, key_pair } =
+        generate_simple_self_signed(vec!["localhost".to_owned()]).expect("gen self-signed cert");
+    let public_key = x509_cert::Certificate::from_der(cert.der())
+        .expect("parse cert")
+        .tbs_certificate
+        .subject_public_key_info
+        .subject_public_key
+        .raw_bytes()
+        .to_vec();
+    let cert_der = CertificateDer::from(cert.der().to_vec());
+    let key_der = PrivateKeyDer::try_from(key_pair.serialize_der()).expect("key der");
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .expect("server config");
+    (
+        tokio_rustls::TlsAcceptor::from(Arc::new(config)),
+        public_key,
+    )
+}
+
+/// Connect over NLA with `password` and return the session if the server kept
+/// it (see [`kept_session`]).
+async fn kept_session_nla(
+    io: tokio::net::TcpStream,
+    password: &str,
+    server_public_key: &[u8],
+) -> Option<TokioFramed<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>> {
+    let attempt = async {
+        let mut config = client_config_with_password(1024, 768, password);
+        config.enable_credssp = true;
+        let mut connector =
+            ClientConnector::new(config, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
+        let mut framed = TokioFramed::new(io);
+        let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector).await?;
+        let initial = framed.into_inner_no_leftover();
+        let mut tls_cfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoCertVerify))
+            .with_no_client_auth();
+        tls_cfg.resumption = rustls::client::Resumption::disabled();
+        let server_name = rustls::pki_types::ServerName::try_from("localhost")?.to_owned();
+        let tls_stream = TlsConnector::from(Arc::new(tls_cfg))
+            .connect(server_name, initial)
+            .await?;
+        let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, &mut connector);
+        let mut tls_framed = TokioFramed::new(tls_stream);
+        let mut net = NoNetworkError;
+        ironrdp_tokio::connect_finalize(
+            upgraded,
+            connector,
+            &mut tls_framed,
+            &mut net,
+            "localhost".into(),
+            server_public_key.to_vec(),
+            None,
+        )
+        .await?
+        .into_connected()?;
+        anyhow::Ok(tls_framed)
+    };
+    let mut framed = tokio::time::timeout(std::time::Duration::from_secs(10), attempt)
+        .await
+        .ok()?
+        .ok()?;
+    stays_open(&mut framed, std::time::Duration::from_millis(700))
+        .await
+        .ok()
+        .map(|()| framed)
+}
+
+/// After a rotation, the old secret must not take over a live session. IronRDP
+/// authenticates a takeover candidate against the credentials captured when
+/// the live session began, so the old secret still completes NLA; the macrdp
+/// validator refuses it before the takeover is decided. The new secret can't
+/// take over that session either (NLA checks the captured credentials), but is
+/// served as soon as the session ends. Runs the real rotation step
+/// (`access_credential::apply`) over NLA, as `main.rs` builds the server.
+#[tokio::test]
+async fn a_rotated_access_credential_cannot_take_over_a_live_session() -> anyhow::Result<()> {
+    use crate::access_credential::{apply, AccessCredentialValidator, CurrentSecret};
+    use zeroize::Zeroizing;
+    init_tracing();
+
+    let probe = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let addr = probe.local_addr()?;
+    drop(probe);
+
+    let (tls, public_key) = server_tls_acceptor_with_public_key();
+    let current = CurrentSecret::new(Zeroizing::new("old-secret".into()));
+    let mut server = RdpServer::builder()
+        .with_addr((Ipv4Addr::LOCALHOST, addr.port()))
+        .with_hybrid(tls, public_key.clone())
+        .with_input_handler(TestInput)
+        .with_display_handler(TestDisplay {
+            size: ServerDesktopSize {
+                width: 1024,
+                height: 768,
+            },
+        })
+        .with_sound_factory(Some(Box::new(KeepAliveSound { audio_sender: None })))
+        .with_bitmap_codecs(crate::bitmap_codecs())
+        .with_connection_policy(ConnectionPolicy::Preempt)
+        .build();
+    server.set_credentials(Some(ironrdp_server::Credentials {
+        username: "test".into(),
+        password: "old-secret".into(),
+        domain: None,
+    }));
+    server.set_credential_validator(Some(Arc::new(AccessCredentialValidator::new(
+        current.clone(),
+    ))));
+    let handle = server.handle().clone();
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run().await;
+            });
+
+            // A: the live session, authenticated with the old secret.
+            let a = connect_with_retry(addr).await?;
+            let mut framed_a = kept_session_nla(a, "old-secret", &public_key)
+                .await
+                .ok_or_else(|| anyhow::anyhow!("the first client should be served"))?;
+
+            assert!(apply(
+                &current,
+                &handle,
+                "test",
+                Some(Zeroizing::new("new-secret".into()))
+            ));
+            // Let the server take the queued credential change.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+            // B: the old secret, trying to take over: refused, and A survives.
+            let b = connect_with_retry(addr).await?;
+            assert!(
+                kept_session_nla(b, "old-secret", &public_key)
+                    .await
+                    .is_none(),
+                "the old secret must not be served after a rotation"
+            );
+            assert!(
+                stays_open(&mut framed_a, std::time::Duration::from_millis(500))
+                    .await
+                    .is_ok(),
+                "a refused takeover must leave the live session alone"
+            );
+
+            // C: the new secret, while A is live: IronRDP still checks the
+            // credentials captured when A began, so it can't take over.
+            let c = connect_with_retry(addr).await?;
+            assert!(
+                kept_session_nla(c, "new-secret", &public_key)
+                    .await
+                    .is_none(),
+                "IronRDP now lets the new secret take over a session begun before the rotation; \
+                 update access_credential::apply's docs and this test"
+            );
+            assert!(
+                stays_open(&mut framed_a, std::time::Duration::from_millis(500))
+                    .await
+                    .is_ok(),
+                "a refused takeover must leave the live session alone"
+            );
+
+            // Once A has gone, the new secret is served and the old one isn't.
+            drop(framed_a);
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let d = connect_with_retry(addr).await?;
+            let framed_d = kept_session_nla(d, "new-secret", &public_key)
+                .await
+                .ok_or_else(|| {
+                    anyhow::anyhow!("the new secret should be served once A has gone")
+                })?;
+            drop(framed_d);
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let e = connect_with_retry(addr).await?;
+            assert!(
+                kept_session_nla(e, "old-secret", &public_key)
+                    .await
+                    .is_none(),
+                "the old secret must stay refused"
+            );
+
+            server_task.abort();
+            anyhow::Ok(())
+        })
+        .await
 }

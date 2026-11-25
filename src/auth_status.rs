@@ -12,7 +12,9 @@
 //! it rejected ([`should_check`]). So a Keychain that unlocks later, or an entry
 //! fixed in Keychain Access, recovers on its own, and waiting adds no failed
 //! logins. An interactive run (stdout is a terminal) still exits with the error,
-//! as before.
+//! as before. In access-credential mode (`src/access_credential.rs`) there is
+//! no account check: the only failure is a missing access credential, which
+//! the server waits out the same way.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -38,6 +40,9 @@ pub enum Failure {
     NoPassword,
     /// The password was read but the account check rejected it.
     WrongPassword,
+    /// `--auth access-credential`: the Keychain has no access credential
+    /// (create one with `macrdp credential rotate`). Never a Mac password.
+    NoAccessCredential,
 }
 
 impl Failure {
@@ -47,6 +52,7 @@ impl Failure {
         match self {
             Failure::NoPassword => "no-password",
             Failure::WrongPassword => "wrong-password",
+            Failure::NoAccessCredential => "no-access-credential",
         }
     }
 }
@@ -126,6 +132,7 @@ mod tests {
     fn status_codes_are_the_controller_contract() {
         assert_eq!(Failure::NoPassword.code(), "no-password");
         assert_eq!(Failure::WrongPassword.code(), "wrong-password");
+        assert_eq!(Failure::NoAccessCredential.code(), "no-access-credential");
         assert_eq!(
             status_contents(Failure::WrongPassword, "alice"),
             "wrong-password\nalice\n"

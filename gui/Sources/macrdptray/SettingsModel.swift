@@ -131,6 +131,10 @@ final class SettingsModel: ObservableObject {
         if draft["MULTI_MONITOR"] == "1" && !multiMonitorAllowed {
             draft["MULTI_MONITOR"] = "0"
         }
+        // Access-credential sign-in => no automatic unlock: it types the Mac
+        // password, which this mode never stores, and the server refuses to
+        // start with both set.
+        if usesAccessCredential, draft["AUTO_UNLOCK"] == "1" { draft["AUTO_UNLOCK"] = "0" }
         // Tunnel off => clear the video-migrate child. Tunnel on + migrate on =>
         // ensure H.264 (the migrate toggle is UI-disabled until the tunnel is on,
         // so this never has to re-enable the tunnel itself).
@@ -152,6 +156,8 @@ final class SettingsModel: ObservableObject {
             && primaryMode == "none"
             && !extra.contains("--no-client-resolution")
     }
+    /// Whether the draft selects access-credential sign-in (AUTH_MODE).
+    var usesAccessCredential: Bool { AccessCredential.isSelected(draft) }
 
     // MARK: - Network bind (loopback <-> all interfaces, port preserved)
 
