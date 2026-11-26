@@ -396,6 +396,11 @@ What's left is testing and filling upstream's own gaps, coordinated with the mai
   Possibly worth an upstream note: two copies of the same macrdp build under one user (not a
   dev build next to the signed app, whose identities differ) would hit it. Found 2026-11-26 in
   Spike C.
+- **Upstream's default port 3390 rests on a wrong premise.** `docs/macos-gotchas.md` says
+  3389 "is privileged" and needs elevated rights; only ports below 1024 are, and a normal
+  user process binds `0.0.0.0:3389` fine on macOS 27.2.1 (tested 2026-11-26). Clients assume
+  3389, so a bare IP misses macrdp. The fork's test install uses 3389. John-Michael wants to
+  argue for 3389 as the upstream default, after Phase 1 works.
 - **FreeRDP `/auth-only`** is a good scripted NLA probe, but `sdl-freerdp` exits 1 even on
   success: read its `Authentication only, ERRBASE_SUCCESS` log line instead.
 
