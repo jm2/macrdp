@@ -216,13 +216,15 @@ with real clients.
 - [ ] **Spike C — handover and reconnect:** a root daemon passes an accepted socket to the user
       instance and to the LoginWindow instance. Measure the server-initiated reconnect on a
       console switch with mstsc (antec-win), Windows App (macOS), FreeRDP 3, and Transom.
-      *(2026-11-25, in progress: branch `spike/broker-handover` (72bf255), see its
+      *(In progress: branch `spike/broker-handover` (24c5719), see its
       `spikes/broker-handover/README.md`. User-space prototype: `--listen-from-broker` over
-      `serve(ConnectionSource)` with no IronRDP change, a toy stdlib broker, two instances.
-      Handover works and shares one access credential; on a `drop` move FreeRDP 3.33
-      reconnected in 4.25 s to the new instance and authenticated from cached credentials.
-      Redirect and error-info moves not yet measured: with the Mac locked the session stalls
-      before IronRDP sends them. Next: re-run unlocked, then mstsc, Windows App, Transom.)*
+      `serve(ConnectionSource)` with no IronRDP change, a toy stdlib broker, two instances
+      sharing one access credential. FreeRDP 3.33.1, 2026-11-26: a Server Redirection PDU
+      (target address only) moved the session to the new instance in 17 ms, re-authenticated
+      with the client's own credentials; a plain drop moved it in 32 ms via auto-reconnect;
+      Set Error Info ended it with no reconnect. The 2026-11-25 numbers (4.25 s, "stalls
+      while locked") were the `replayd` eviction in §10a, not the lock. Next: mstsc, Windows
+      App and Transom through the broker; locked-Mac re-run.)*
 - [ ] **Spike D — FileVault on macOS 27 (Apple silicon):** on mbp16-m1max (FileVault on,
       Remote Login on) or a FileVault-on guest, reboot, then SSH-unlock. Record: (1) whether the network
       stays up after unlock with nobody logged in, on Ethernet and on WPA2-Personal Wi-Fi;
@@ -382,6 +384,16 @@ What's left is testing and filling upstream's own gaps, coordinated with the mai
   but in access-credential mode that value is the access secret. Fixed in e461812 (it takes
   `unlock_password`, empty in this mode). After each rebase, grep upstream's diff for new
   `password`/`Credentials` uses.
+- **Two macrdp processes with the same code identity in one user's GUI session break each
+  other's capture** (macOS 27.2.1). Both then log `RPDaemonProxy: connection INTERRUPTED`
+  1,400–2,400 times a second: `replayd` keeps dropping one for the other, and `SCStream`
+  `startCapture` never returns, so a session stops at "Starting client loop" with nothing
+  sent. A copy re-signed with another ad-hoc identifier doesn't conflict. Phase 2 must never
+  overlap two capturing instances of one build in one GUI session (a hand-off, a restart);
+  the B1/B2 probe run should show whether the LoginWindow instance gets its own `replayd`.
+  Possibly worth an upstream note: two copies of the same macrdp build under one user (not a
+  dev build next to the signed app, whose identities differ) would hit it. Found 2026-11-26 in
+  Spike C.
 - **FreeRDP `/auth-only`** is a good scripted NLA probe, but `sdl-freerdp` exits 1 even on
   success: read its `Authentication only, ERRBASE_SUCCESS` log line instead.
 
@@ -392,3 +404,4 @@ What's left is testing and filling upstream's own gaps, coordinated with the mai
 | 2026-11-24 | 1 | 0 | Fork setup done (`upstream` remote added; `main` == upstream f46bfd9; branch `feat/loginwindow-phase0`). Built the B1/B2 probe (`spikes/loginwindow-probe/`): a Swift LaunchAgent that records uid, security session, CGSession, TCC preflights and code signature, tries six capture paths (SCK content/screenshot/stream, CGDisplayStream, CGDisplayCreateImage, CGWindowListCreateImage, `screencapture`), runs a net-zero type/erase per event tap at the login window, and exposes a token-gated loopback command socket (`ctl.sh`). Smoke-tested from the user session while the Mac was locked with its display asleep: SCK lists no displays, and the CoreGraphics paths return black frames (as upstream's #231 note says), so the capture code is only validated end to end once it runs against an awake screen. Found that upstream IronRDP already provides `ConnectionSource`/`serve` and `ServerRedirectionHandle` (see §4), which shrinks Option L's hooks 2 and 4. | User: `build.sh`, `sudo install.sh`, grant Screen Recording + Accessibility, Fast-User-Switch to the login window for ≥60 s, log back in. Then analyse `latest-loginwindow/`, drive Return with a throwaway test account, and write up B1/B2. |
 | 2026-11-24 | 2 | 1 | Target set to macOS 27.2.1 (26/15 inferred). Phase 1 implemented on `feat/access-credential` (033b5ad, off upstream f46bfd9, pushed to the fork): `--auth access-credential` / `AUTH_MODE`, `macrdp credential rotate\|status\|show-username`, Keychain item `macrdp-access` written through `security -i` on stdin, stamp-file rotation with no restart and no Keychain polling, a validator against the current secret (closes the takeover gap in §10a), `--auto-unlock`/`--password`/`--password-file`/`--skip-auth` refused, the new `no-access-credential` status, controller sign-in picker + show-once dialog, and docs. 459 tests pass, including NLA rotation/takeover tests (mutation-checked); fmt + clippy clean on 1.95.0. Live on this Mac with FreeRDP 3.33 over NLA: the current secret is accepted; wrong, rotated-out and removed ones are refused; rotation applies within 3 s via `config.env`. | User: accept the Xcode license (`sudo xcodebuild -license`) so the controller can be built and clicked through; live-verify with mstsc, Windows App and Transom (sign in, lock, unlock at the lock screen, rotate); decide on a fork-internal draft PR to run CI (Linux job included). Then open the upstream PR. Phase 0 B1/B2 still waits on the probe run (`sudo spikes/loginwindow-probe/install.sh`, grant, Fast-User-Switch). |
 | 2026-11-25 | 3 | 1, 4 | Checked upstream: 12 commits to v0.11.2, then 3 TODO-only commits (132ebdf). Multi-monitor shipped upstream, so Phase 4 is rewritten around testing it. Fast-forwarded the fork's `main` to 132ebdf; rebased `feat/access-credential` onto it (two keep-both conflicts in `conn_test.rs` and `SettingsModel.swift`, plus a silent merge of upstream's new watcher call that received the secret, fixed) and force-pushed it as e461812; 483 tests pass, fmt + clippy clean on 1.95.0, the controller type-check matches upstream's (11 diagnostics, all missing SwiftUI macros). Rebased this branch onto 132ebdf too. The startup display-asleep bug is still present upstream. #237 has a new maintainer comment (multi-user sessions are out of scope); login-screen support is still an open enhancement with no timeline. Then started Spike C on `spike/broker-handover` (72bf255): handover works, FreeRDP reconnects in 4.25 s after a drop, redirect not yet measured (sessions stall while the Mac is locked); four Phase 2 findings in that README (brokered connections lose the RTT that gates blank recovery, close-on-exec, AF_UNIX path length, broker peer checks). | Same as session 2 (Xcode license, live client tests, probe run for B1/B2). Spike C: re-run `spikes/broker-handover/run-local.sh` with the Mac unlocked, then the real clients. |
+| 2026-11-26 | 3 (cont.) | 0 | Spike C measured with the Mac unlocked. The capture stall seen on 2026-11-25 wasn't the lock: two macrdp processes with the same code identity evict each other from `replayd` and `startCapture` never returns (new §10a finding); instance b now runs from a re-signed copy. FreeRDP 3.33.1: redirect moves the session in 17 ms, drop + auto-reconnect in 32 ms, Set Error Info disconnects without a reconnect. README and `run-local.sh` updated (24c5719, pushed). | Spike C with mstsc, Windows App and Transom through the broker (needs the user at those clients), and a locked-Mac re-run. Then as before: Xcode license, Phase 1 live client tests, probe run for B1/B2. |
