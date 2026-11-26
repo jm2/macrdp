@@ -8,6 +8,11 @@ cd "$(dirname "$0")/../.."
 W="${SPIKEC_DIR:-${TMPDIR%/}/spikec-run}"; rm -rf "$W"; mkdir -p "$W"
 B=target/debug/macrdp
 ACCT=lwtest-probe
+# Two processes with the same code identity in one login session evict each
+# other from replayd (ScreenCaptureKit's daemon) in a tight loop, and
+# SCStream startCapture never returns. Instance b gets a copy of the binary
+# with its own ad-hoc signing identifier.
+BB="$W/macrdp-b"; cp "$B" "$BB" && codesign -s - -i org.macrdp.spike-b -f "$BB" 2>/dev/null
 # AF_UNIX paths are capped at 104 bytes, so the broker sockets get a short
 # per-user temp dir of their own, removed on exit.
 BDIR="${TMPDIR%/}/mrb-spikec"
@@ -36,7 +41,8 @@ for _ in $(seq 20); do [ -S "$BDIR/control.sock" ] && break; sleep 0.25; done
 S=$($B --config "$W/a/config.env" credential rotate 2>/dev/null)
 caffeinate -d -u -t 180 & sleep 2  # keep the display on: capture stalls while it sleeps
 for n in a b; do
-    $B --config "$W/$n/config.env" >"$W/$n/stdout" 2>&1 &
+    BIN=$B; [ "$n" = b ] && BIN=$BB
+    $BIN --config "$W/$n/config.env" >"$W/$n/stdout" 2>&1 &
     for _ in $(seq 60); do grep -q "instance '$n' registered" "$W/broker.log" && break; sleep 0.5; done
     grep -q "instance '$n' registered" "$W/broker.log" || { echo "instance $n did not register:"; tail -2 "$W/$n/log/macrdp.log" | cut -c1-200; }
 done

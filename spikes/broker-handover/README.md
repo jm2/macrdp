@@ -18,25 +18,50 @@ Never part of an upstream PR as is.
   (root = the login window).
 - `run-local.sh`: broker on 127.0.0.1:3392, instances `a` and `b` (same user, same access
   credential under the throwaway Keychain account `lwtest-probe`, removed on exit), FreeRDP 3
-  through each method. Needs `cargo build` first; the Mac must be **unlocked** (see below).
+  through each method. Needs `cargo build` first. Instance `b` runs from a copy of the binary
+  re-signed with its own ad-hoc identifier (see the first finding below).
 
-## Results so far (2026-11-25, macOS 27.2.1, FreeRDP 3.33, Mac locked)
+## Results (2026-11-26, macOS 27.2.1, FreeRDP 3.33.1, Mac unlocked)
 
-- Handover works: both instances register, and FreeRDP authenticates over NLA through the
-  broker to whichever instance is current, with one shared access credential.
-- `drop`: FreeRDP (`+auto-reconnect`) reconnected 4.25 s after the move (twice, 4254 and
-  4259 ms), the broker routed it to the new instance, which authenticated it from FreeRDP's
-  cached credentials and started the session.
-- `redirect`: **not yet measured.** With the Mac locked, a session stalls right after
-  "Starting client loop" (no events dispatched, apparently waiting on capture), and IronRDP
-  sends the Server Redirection PDU from that loop, so it never went out and FreeRDP stayed
-  connected. `drop` still ended the stalled session. Re-run with the Mac unlocked.
-- `errinfo`: FreeRDP also reconnected after 4.25 s, but it logged a connection reset, not the
-  error info, so this run doesn't show how FreeRDP treats "disconnected by another
-  connection". Re-run with the Mac unlocked too.
+Handover works: both instances register, and FreeRDP authenticates over NLA through the
+broker to whichever instance is current, with one shared access credential. Moving a live
+session from `a` to `b`, timed from the broker's switch command:
+
+| Method | What FreeRDP did | New connection on `b` |
+|---|---|---|
+| `redirect` (Server Redirection PDU, `TARGET_NET_ADDRESS` = 127.0.0.1 only) | Followed it: reconnected to the same port, authenticated with its own credentials, and `b` sent frames | 17 ms |
+| `drop` (`ServerEvent::Quit`, a plain close) | Auto-reconnected at once (`+auto-reconnect`), authenticated from cached credentials, and `b` sent frames | 32 ms |
+| `errinfo` (Set Error Info, then Disconnect Provider Ultimatum) | Showed "ERRINFO_RPC_INITIATED_DISCONNECT … initiated by an administrative tool" and stayed disconnected | none |
+
+Details:
+
+- `redirect`: the PDU went out 6 ms after instance `a` read the broker's MOVE, and its session ended
+  `Ok(Redirected)` 4 ms later. The redirected session authenticated on `b` 3 ms after it
+  connected and got a new auto-reconnect cookie. The PDU carried no credentials, no load
+  balancing info and no port; FreeRDP reused its own.
+- `errinfo`: IronRDP logged "client did not opt into Set Error Info PDUs; disconnecting
+  without the reason", so only the ultimatum went out; FreeRDP names that "RPC initiated
+  disconnect" itself and doesn't auto-reconnect after a server-initiated disconnect. Useful
+  for ending a session with a reason, not for moving one.
+- Only FreeRDP so far. mstsc, Windows App and Transom still need the same three runs; a
+  redirect to a different host name may make them prompt for credentials.
+- Superseded: the 2026-11-25 runs (Mac locked) stalled every session at capture start and
+  measured `drop` at 4.25 s. That stall was the `replayd` eviction below, not the lock;
+  locked-Mac behaviour hasn't been re-run since.
 
 ## Findings for Phase 2
 
+- **Two macrdp processes with the same code identity in one login session break each
+  other's capture.** From the moment the second one starts, both log
+  `RPDaemonProxy: connection INTERRUPTED` about 1,400–2,400 times a second, in lockstep:
+  `replayd` (ScreenCaptureKit's daemon, which stays up) keeps dropping one connection for the
+  other, and `SCStream` `startCapture` never returns, so the session stops at "Starting
+  client loop" with nothing sent. Re-signing one copy with another ad-hoc identifier (`codesign
+  -s - -i org.macrdp.spike-b -f`) stopped it: zero interruptions, frames on both. That changes
+  the signing identifier and the cdhash, so which one `replayd` keys on isn't known. Phase 2
+  must never run two capturing instances of one build in the same user's GUI session (an
+  overlapping hand-off or restart, two copies of the app). Whether the login-window instance
+  shares `replayd` with a user's instance is for the B1/B2 probe run.
 - `IncomingConnection`'s accept-time RTT (macrdp divergence 15) is crate-private, so a
   brokered connection reaches blank recovery as RTT 0, which counts as LAN: the slow-link
   disarm (the ZeroTier false-drop fix) is lost. Phase 2 needs a public setter in the IronRDP
@@ -49,5 +74,6 @@ Never part of an upstream PR as is.
   `LOCAL_PEERCRED`), or any local process could register as the console user's instance
   and receive their connections. The toy broker relies on a 0700 directory only.
 - Two instances started at once with one `--cert-dir`: one stalled right after generating
-  the certificate. Separate cert dirs plus a staggered start fixed it; which of the two
-  mattered wasn't isolated.
+  the certificate (2026-11-25). Separate cert dirs plus a staggered start fixed it. On
+  2026-11-26 two instances with separate cert dirs started at the same moment without
+  stalling, same identity or not, so the cause is still unexplained; the script keeps both.
