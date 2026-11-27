@@ -247,8 +247,8 @@ with real clients.
 ### Phase 1 — Access-credential mode (≈1–2 weeks; independent of Phase 0's outcome)
 - [x] `--auth access-credential` (config `AUTH_MODE=access-credential`): skip the PAM check;
       IronRDP `Credentials` come from the access credential. Default stays `account`.
-      *(Branch `feat/access-credential` e461812, rebased 2026-11-25 onto upstream 132ebdf
-      (v0.11.2); first cut 033b5ad off f46bfd9. Plus a
+      *(Branch `feat/access-credential` 7938703, rebased 2026-11-27 onto upstream f5ffcb3
+      (v0.12.0); earlier e461812 on 132ebdf, first cut 033b5ad off f46bfd9. Plus a
       `CredentialValidator` against the current secret: see §11, session 2.)*
 - [x] `macrdp credential rotate|show-username|status`; random secret shown once; Keychain item
       separate from anything the account-password flow uses. *(Service `macrdp-access`;
@@ -272,7 +272,9 @@ with real clients.
       releases" convention from upstream's `CLAUDE.md`. *(README, configuration, cli,
       features, architecture, gotchas, known-quirks, config.env.example. "Recent releases" is
       updated at a release cut, so not in this PR.)*
-- [ ] Open the upstream PR.
+- [ ] Open the upstream PR. *(Only after John-Michael reviews and approves it. CI runs on a
+      fork-internal draft, jm2/macrdp#1 (base `jm2:main` == upstream `main`), opened
+      2026-11-27; it is not for merging.)*
 - **DoD:** a fresh install in this mode never asks for or stores the Mac password, and a remote
   user unlocks via the real lock screen.
 
@@ -388,9 +390,10 @@ What's left is testing and filling upstream's own gaps, coordinated with the mai
   client kept showing the virtual display's desktop while its keystrokes went to the (unseen)
   password field; locked by `--lock-on-disconnect` and then *reconnected*, the client saw the
   login screen and unlocked by typing. Phase 1's DoD ("a remote user unlocks via the real lock
-  screen") needs both cases checked live, per primary mode. Upstream plans to make the virtual
-  display main while a client is connected (TODO, 2026-11-26), which would change the first
-  case; re-check when it lands.
+  screen") needs both cases checked live, per primary mode. Upstream has since shipped
+  `--main-display-while-connected` (#304, v0.12.0), which makes the virtual display main while
+  a client is connected; with it the lock screen should draw on the display the client sees.
+  Check that live: it would be the cleanest unlock path for access-credential mode.
 - **Rebasing onto upstream can merge new password uses silently.** v0.11.x added a fourth
   `spawn_primary_overlay_watcher` call taking `Arc::clone(&password)`; git merged it cleanly,
   but in access-credential mode that value is the access secret. Fixed in e461812 (it takes
@@ -457,3 +460,4 @@ What's left is testing and filling upstream's own gaps, coordinated with the mai
 | 2026-11-25 | 3 | 1, 4 | Checked upstream: 12 commits to v0.11.2, then 3 TODO-only commits (132ebdf). Multi-monitor shipped upstream, so Phase 4 is rewritten around testing it. Fast-forwarded the fork's `main` to 132ebdf; rebased `feat/access-credential` onto it (two keep-both conflicts in `conn_test.rs` and `SettingsModel.swift`, plus a silent merge of upstream's new watcher call that received the secret, fixed) and force-pushed it as e461812; 483 tests pass, fmt + clippy clean on 1.95.0, the controller type-check matches upstream's (11 diagnostics, all missing SwiftUI macros). Rebased this branch onto 132ebdf too. The startup display-asleep bug is still present upstream. #237 has a new maintainer comment (multi-user sessions are out of scope); login-screen support is still an open enhancement with no timeline. Then started Spike C on `spike/broker-handover` (72bf255): handover works, FreeRDP reconnects in 4.25 s after a drop, redirect not yet measured (sessions stall while the Mac is locked); four Phase 2 findings in that README (brokered connections lose the RTT that gates blank recovery, close-on-exec, AF_UNIX path length, broker peer checks). | Same as session 2 (Xcode license, live client tests, probe run for B1/B2). Spike C: re-run `spikes/broker-handover/run-local.sh` with the Mac unlocked, then the real clients. |
 | 2026-11-26 | 3 (cont.) | 0 | Spike C measured with the Mac unlocked. The capture stall seen on 2026-11-25 wasn't the lock: two macrdp processes with the same code identity evict each other from `replayd` and `startCapture` never returns (new §10a finding); instance b now runs from a re-signed copy. FreeRDP 3.33.1: redirect moves the session in 17 ms, drop + auto-reconnect in 32 ms, Set Error Info disconnects without a reconnect. README and `run-local.sh` updated (24c5719, pushed). Xcode 27.2's license accepted; the controller on `feat/access-credential` builds (release, Xcode toolchain via `DEVELOPER_DIR`) with the same two Combine-import warnings as upstream `main`. | Spike C with mstsc, Windows App and Transom through the broker (needs the user at those clients), and a locked-Mac re-run. Install the fork build to click through the controller and run the Phase 1 live client tests. Probe run for B1/B2. |
 | 2026-11-26 | 3 (cont.) | 1 | Installed the fork build (e461812: `make-app.sh`, the controller, the LaunchAgent) with `AUTH_MODE=access-credential`, mirror-primary; Screen Recording and Accessibility granted, credential created by John-Michael. Moved the test install to port 3389 (upstream's 3390 rests on a wrong premise, §10a). LAN clients first hung because the Application Firewall held their connections behind an unanswered prompt (§10a); after Allow, Windows App for Android signed in with the access credential and ran a 10-minute session. 2026-11-27: John-Michael locked the Mac during a session and unlocked it at the real lock screen from the phone, twice; the phone's keyboard offered autocomplete in the password field, which RDP gives the server no way to prevent (§10a). mstsc on Windows 11 and the yoga9i client (presumably Transom) signed in too. Wi-Fi sessions were laggy on the bitmap path, so the test install now runs `ENABLE_H264=1` + `ADAPTIVE_BITRATE=1`, which John-Michael called much better (§10a). | Phase 1 live tests from mstsc and Transom on antec-win: sign in, lock during a session and unlock at the lock screen, lock-on-disconnect + reconnect (needs a shield mode), rotate while connected, non-US layout; click through the controller. Then Spike C with real clients and the probe run for B1/B2. |
+| 2026-11-27 | 4 | 1 | Upstream released v0.12.0 (14 commits, f5ffcb3). Fast-forwarded the fork's `main` to it and rebased `feat/access-credential` (now 7938703). Two conflicts: `docs/cli.md`, and `src/main.rs`, where upstream split the plain-mode window watcher call in two for `--main-display-while-connected`; both new calls passed `password` and now take `unlock_password` (no other new `password`/`Credentials` uses in upstream's diff). Upstream also bumped IronRDP (takeover candidates negotiated concurrently, #307) and refunds authenticated connections in the rate limiter (#311); the rotation and takeover tests pass on the new pin. Rust 1.95.0 (CI's version): fmt + clippy clean, 501 tests pass; the controller builds with Xcode 27.2 (the same two warnings as upstream). Added a docs commit: phone keyboards (incognito or a hardware keyboard) and the clients now verified to delegate. Opened jm2/macrdp#1, a fork-internal draft, to run CI (Linux included). Rebased this branch onto f5ffcb3; `spike/broker-handover` left on the old base. No `macrdp-dev` signing identity exists, so reinstalling the test install drops its TCC grants. | John-Michael: review jm2/macrdp#1. Reinstall the rebased build (re-grant Screen Recording + Accessibility, maybe the firewall; or create `macrdp-dev` first), then the live tests: mstsc lock/unlock, rotate while connected, controller click-through, Windows App (macOS/Windows) delegation; optionally lock-on-disconnect + reconnect under `--shield-primary`, and the lock screen with `--main-display-while-connected`. Then the upstream PR, only with his approval. |
