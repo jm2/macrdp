@@ -261,6 +261,10 @@ with real clients.
 - [x] `--auto-unlock` hard-errors in this mode, with a message explaining why.
 - [ ] Live-verify: lock, reconnect, and type the password at the lock screen from mstsc and
       Transom (non-US layout too, given upstream's keymap notes).
+      *(2026-11-26: fork build e461812 installed as the LaunchAgent on port 3389, mirror-primary.
+      First real-client sign-in with the access credential: Windows App for Android (build
+      79461) over the LAN, NLA, a 10-minute session on the legacy bitmap path at 1080×2240.
+      Lock/unlock, rotation and the other clients still to do.)*
 - [x] Docs: README section, `docs/configuration.md`, security trade-offs; the README "Recent
       releases" convention from upstream's `CLAUDE.md`. *(README, configuration, cli,
       features, architecture, gotchas, known-quirks, config.env.example. "Recent releases" is
@@ -333,7 +337,8 @@ What's left is testing and filling upstream's own gaps, coordinated with the mai
   `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build` (Xcode 27.2's
   license accepted 2026-11-26; `xcode-select` left as it is). The local Rust is 1.98;
   CI pins 1.95.0 (installed via rustup for parity: run fmt/clippy with `+1.95.0`).)*
-- **Clients:** Transom and FreeRDP 3 on antec; mstsc on antec-win; Windows App on macOS.
+- **Clients:** Transom and FreeRDP 3 on antec; mstsc on antec-win; Windows App on macOS;
+  Windows App for Android on a Pixel 10 Pro XL.
 
 ## 9. Fallbacks if upstream says no
 1. **Phase 1 rejected:** keep it as a small fork patch; it's isolated and cheap to rebase.
@@ -371,7 +376,8 @@ What's left is testing and filling upstream's own gaps, coordinated with the mai
   event. Possibly worth an upstream IronRDP test/doc PR.
 - **The validator needs delegated credentials.** With a validator set, IronRDP refuses a client
   that completes NLA without delegating credentials (Restricted Admin / Remote Credential
-  Guard). FreeRDP 3.33 delegates; mstsc, Windows App and Transom are still to be checked.
+  Guard). FreeRDP 3.33 and Windows App for Android (build 79461) delegate; mstsc, Windows
+  App on macOS/Windows and Transom are still to be checked.
 - **What the remote client sees of the lock screen depends on the display arrangement.**
   `loginwindow` draws the lock screen on the main display. Upstream's notes on `--shield-primary`
   (default keep-physical-main) record two different outcomes: locked *during* a session, the
@@ -401,6 +407,18 @@ What's left is testing and filling upstream's own gaps, coordinated with the mai
   user process binds `0.0.0.0:3389` fine on macOS 27.2.1 (tested 2026-11-26). Clients assume
   3389, so a bare IP misses macrdp. The fork's test install uses 3389. John-Michael wants to
   argue for 3389 as the upstream default, after Phase 1 works.
+- **The macOS Application Firewall holds a new ad-hoc macrdp's connections until someone
+  answers its prompt.** With the firewall on, the first inbound connection to a freshly
+  installed ad-hoc `macrdp.app` raised "accept incoming network connections?", and the
+  firewall queued every flow while the prompt waited (unified log, subsystem
+  `com.apple.ALF.ApplicationFirewall`: `Enqueuing new inbound flow for macrdp`). Clients just
+  hang: mstsc at "Configuring remote session", Transom at "Contacting the remote computer".
+  macrdp logs nothing, because nothing reaches it. `socketfilterfw --getappblocked` reported
+  the app as permitted throughout; `--listapps` showed no rule until the prompt was answered.
+  Fix: click Allow, or `sudo socketfilterfw --add` then `--unblockapp` on the app. An ad-hoc
+  rebuild probably needs this again, as the TCC grants do (unverified). Upstream's docs don't
+  mention the firewall at all; a troubleshooting note is worth an upstream PR. For Phase 2, the
+  installer should add the rule for the broker, the process that listens. Found 2026-11-26.
 - **FreeRDP `/auth-only`** is a good scripted NLA probe, but `sdl-freerdp` exits 1 even on
   success: read its `Authentication only, ERRBASE_SUCCESS` log line instead.
 
@@ -412,3 +430,4 @@ What's left is testing and filling upstream's own gaps, coordinated with the mai
 | 2026-11-24 | 2 | 1 | Target set to macOS 27.2.1 (26/15 inferred). Phase 1 implemented on `feat/access-credential` (033b5ad, off upstream f46bfd9, pushed to the fork): `--auth access-credential` / `AUTH_MODE`, `macrdp credential rotate\|status\|show-username`, Keychain item `macrdp-access` written through `security -i` on stdin, stamp-file rotation with no restart and no Keychain polling, a validator against the current secret (closes the takeover gap in §10a), `--auto-unlock`/`--password`/`--password-file`/`--skip-auth` refused, the new `no-access-credential` status, controller sign-in picker + show-once dialog, and docs. 459 tests pass, including NLA rotation/takeover tests (mutation-checked); fmt + clippy clean on 1.95.0. Live on this Mac with FreeRDP 3.33 over NLA: the current secret is accepted; wrong, rotated-out and removed ones are refused; rotation applies within 3 s via `config.env`. | User: accept the Xcode license (`sudo xcodebuild -license`) so the controller can be built and clicked through; live-verify with mstsc, Windows App and Transom (sign in, lock, unlock at the lock screen, rotate); decide on a fork-internal draft PR to run CI (Linux job included). Then open the upstream PR. Phase 0 B1/B2 still waits on the probe run (`sudo spikes/loginwindow-probe/install.sh`, grant, Fast-User-Switch). |
 | 2026-11-25 | 3 | 1, 4 | Checked upstream: 12 commits to v0.11.2, then 3 TODO-only commits (132ebdf). Multi-monitor shipped upstream, so Phase 4 is rewritten around testing it. Fast-forwarded the fork's `main` to 132ebdf; rebased `feat/access-credential` onto it (two keep-both conflicts in `conn_test.rs` and `SettingsModel.swift`, plus a silent merge of upstream's new watcher call that received the secret, fixed) and force-pushed it as e461812; 483 tests pass, fmt + clippy clean on 1.95.0, the controller type-check matches upstream's (11 diagnostics, all missing SwiftUI macros). Rebased this branch onto 132ebdf too. The startup display-asleep bug is still present upstream. #237 has a new maintainer comment (multi-user sessions are out of scope); login-screen support is still an open enhancement with no timeline. Then started Spike C on `spike/broker-handover` (72bf255): handover works, FreeRDP reconnects in 4.25 s after a drop, redirect not yet measured (sessions stall while the Mac is locked); four Phase 2 findings in that README (brokered connections lose the RTT that gates blank recovery, close-on-exec, AF_UNIX path length, broker peer checks). | Same as session 2 (Xcode license, live client tests, probe run for B1/B2). Spike C: re-run `spikes/broker-handover/run-local.sh` with the Mac unlocked, then the real clients. |
 | 2026-11-26 | 3 (cont.) | 0 | Spike C measured with the Mac unlocked. The capture stall seen on 2026-11-25 wasn't the lock: two macrdp processes with the same code identity evict each other from `replayd` and `startCapture` never returns (new §10a finding); instance b now runs from a re-signed copy. FreeRDP 3.33.1: redirect moves the session in 17 ms, drop + auto-reconnect in 32 ms, Set Error Info disconnects without a reconnect. README and `run-local.sh` updated (24c5719, pushed). Xcode 27.2's license accepted; the controller on `feat/access-credential` builds (release, Xcode toolchain via `DEVELOPER_DIR`) with the same two Combine-import warnings as upstream `main`. | Spike C with mstsc, Windows App and Transom through the broker (needs the user at those clients), and a locked-Mac re-run. Install the fork build to click through the controller and run the Phase 1 live client tests. Probe run for B1/B2. |
+| 2026-11-26 | 3 (cont.) | 1 | Installed the fork build (e461812: `make-app.sh`, the controller, the LaunchAgent) with `AUTH_MODE=access-credential`, mirror-primary; Screen Recording and Accessibility granted, credential created by John-Michael. Moved the test install to port 3389 (upstream's 3390 rests on a wrong premise, §10a). LAN clients first hung because the Application Firewall held their connections behind an unanswered prompt (§10a); after Allow, Windows App for Android signed in with the access credential and ran a 10-minute session. | Phase 1 live tests from mstsc and Transom on antec-win: sign in, lock during a session and unlock at the lock screen, lock-on-disconnect + reconnect (needs a shield mode), rotate while connected, non-US layout; click through the controller. Then Spike C with real clients and the probe run for B1/B2. |
