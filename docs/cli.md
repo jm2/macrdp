@@ -24,6 +24,10 @@ Useful CLI flags (see `src/main.rs::Args` for the full set):
                           #   Config key PASSWORD_FILE (turns the USE_KEYCHAIN default off;
                           #   an explicit USE_KEYCHAIN=1 with it is an error)
 --skip-auth               # bypass PAM (also skips password validation)
+--auth access-credential  # clients sign in with a random access credential instead of the
+                          #   Mac password (never stored or checked). Config key AUTH_MODE.
+                          #   `macrdp credential rotate|status|show-username` manages it;
+                          #   see docs/configuration.md "Access-credential sign-in".
 --width  / --height       # override autodetected display size. With --virtual-display
                           #   (VD_WIDTH/VD_HEIGHT) the display's starting size; with
                           #   client-resolution auto-adopt on (the default) it starts
