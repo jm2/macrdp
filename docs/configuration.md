@@ -462,10 +462,10 @@ macrdp --config <config.env> credential rotate   # use USERNAME/AUTH_MODE from t
   connections must use the new secret within about 2 s. The server never reads the
   Keychain on a timer, because a login keychain set to lock itself would raise an
   unlock prompt on every read. A change made another way (Keychain Access,
-  `security`) applies at the next start. A live session stays connected. The old secret can't take it over (a validator compares every
-  client's password with the current secret), and the new one can take it over only
-  once it has ended, because IronRDP checks a takeover against the credentials
-  captured when the session began.
+  `security`) applies at the next start. A live session stays connected. The old
+  secret can't take it over (a validator compares every client's password with the
+  current secret), and the new one can take it over only once it has ended, because
+  IronRDP checks a takeover against the credentials captured when the session began.
 - **Removing the item** (Keychain Access, or `security delete-generic-password -s
   macrdp-access -a <user>`) takes effect at the next start. A server that starts with
   no credential waits for one, checking every 30 s, and the menu-bar controller
@@ -478,9 +478,15 @@ macrdp --config <config.env> credential rotate   # use USERNAME/AUTH_MODE from t
   the access credential alone, exactly as it is with the account password in the
   default mode.
 - **Clients must delegate their credentials** in the NLA exchange, as standard
-  CredSSP does (verified with FreeRDP 3.33; mstsc and Windows App not yet verified
-  live). A client using Restricted Admin or Remote Credential Guard doesn't delegate,
+  CredSSP does. Verified live with FreeRDP 3.33, mstsc on Windows 11 (build 26100)
+  and Windows App for Android (build 79461); Windows App for macOS and Windows not
+  yet. A client using Restricted Admin or Remote Credential Guard doesn't delegate,
   and is refused.
+- **On a phone, watch the keyboard when you type the Mac password.** The client
+  decides how its on-screen keyboard behaves, and RDP has no way for the server to
+  mark the lock screen's field as a password field, so a phone keyboard may suggest
+  words for the password and learn it (seen with Gboard in Windows App for Android).
+  Switch the keyboard to incognito mode first, or use a hardware keyboard.
 
 ## Headless mode
 
